@@ -340,6 +340,7 @@ Notes:
 - On AVR, keep block length and sample rate conservative.
 
 The minimal invocation to run these examples: 
+
     python3 plot_motor_stream.py --port /dev/tty.usbmodem1101
 
 ---
@@ -412,6 +413,41 @@ The code (of now) implements PID position control for both motors, allowing them
 #### issues
 - the different link modes (scale factor) are not working flawlessly yet, due to resetting of positions
 - velocity (signal) has not been implemented yet, this can be continued later 
+
+### PSD
+this module uses a Sharp GP2Y0A710K0F (100–550cm) on Arduino Uno A0.
+
+It supports raw, volts, cm, each with or without averaging 
+
+Calibration uses a common inverse model derived from the datasheet endpoints (approx):
+cm = A / (V - B) with defaults based on ~2.5V@100cm and ~1.4V@500cm from [Makerguides.com](https://www.makerguides.com/sharp-gp2y0a710k0f-ir-distance-sensor-arduino-tutorial/?utm_source=chatgpt.com) A and B can be tuned as ``psd.cal_a`` and ``psd.cal_b``.
+
+#### Usage example (serial)
+
+Assuming you register the module stream (default id 5):
+
+    !format:csv
+    !rate:50
+    !stream:5
+
+the following modes are available:
+
+    !psd.mode:0   # raw
+    !psd.mode:1   # volts
+    !psd.mode:3   # avg volts
+    !psd.mode:4   # cm
+    !psd.mode:5   # avg cm
+
+
+Tune averaging:
+
+    !psd.window:10
+
+
+Tune calibration (if needed):
+
+    !psd.cal_a:137.5
+    !psd.cal_b:1.125
 
 
 
