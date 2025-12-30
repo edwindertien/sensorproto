@@ -2,8 +2,8 @@
 
 UniProto is a small serial protocol + helper library for:
 - **Streaming sensor data** in multiple formats (CSV, Arduino Serial Plotter, debug text, binary frames)
-- **Querying and setting parameters** (PID gains, sensor modes, calibration constants, ratesâŠ)
-- **Triggering actions** (zero encoders, stop motors, reset sample blocksâŠ)
+- **Querying and setting parameters** (PID gains, sensor modes, calibration constants, rates)
+- **Triggering actions** (zero encoders, stop motors, reset sample blocks)
 
 It is designed to stay **AVR-friendly** (no heap allocations, no `String` required) while also working on faster boards like **RP2040 (Earle Philhower core)**.
 
@@ -31,7 +31,7 @@ src/
 ```
 
 - **UniProto**: command parser, stream scheduler, registry for streams/params/actions
-- **UniWriter**: âwritersâ that turn fields into CSV / Plotter / Text / Binary
+- **UniWriter**: writers that turn fields into CSV / Plotter / Text / Binary
 - **modules/**: self-contained drivers that register streams/params/actions (ADC, motors, etc.)
 - **main.cpp**: wiring / config / module registration (kept intentionally clean)
 
@@ -75,10 +75,10 @@ Modules never print formatting directly. They emit typed fields through a `UniFr
 UniProto chooses the active writer based on `format`.
 
 Supported formats:
-- `csv` â comma-separated numeric fields (good for logging & Python)
-- `ap` â Arduino Serial Plotter style `name:value,name:value`
-- `txt` â readable debug-style frames
-- `bin` â binary frame header + fixed payload (best for blocks)
+- `csv`  comma-separated numeric fields (good for logging & Python)
+- `ap`   Arduino Serial Plotter style `name:value,name:value`
+- `txt`  readable debug-style frames
+- `bin`  binary frame header + fixed payload (best for blocks)
 
 ---
 
@@ -88,7 +88,7 @@ UniProto uses a single, minimal command grammar:
 
 ### Capabilities / help
 - `?`  
-  Prints a JSON âcapsâ object listing available streams/params/actions and command grammar.
+  Prints a JSON 'caps' object listing available streams/params/actions and command grammar.
 
 ### Get a value
 - `?key`
@@ -158,13 +158,13 @@ Include timestamps in text/CSV/plotter prefixes and binary headers.
 ### `stream`
 Enable/disable streams.
 
-- `!stream:0` â disable all
-- `!stream:N` â enable only stream N
-- `!stream:+N` â enable stream N
-- `!stream:-N` â disable stream N
+- `!stream:0`  disable all
+- `!stream:N`  enable only stream N
+- `!stream:+N`  enable stream N
+- `!stream:-N`  disable stream N
 
 Query current state:
-- `?stream` â returns `stream:0` or `stream:1,3,...`
+- `?stream`  returns `stream:0` or `stream:1,3,...`
 
 ---
 
@@ -267,7 +267,7 @@ Serial.println(freeRam());
 
 All Python scripts use the same basic flow:
 1) Open the serial port (Arduino Uno typically resets on open; wait ~2s)
-2) Send a small âsetup sequenceâ using UniProto commands
+2) Send a small 'setup sequence' using UniProto commands
 3) Read lines (CSV / plotter / text) or binary frames (blocks)
 4) Plot or log
 
@@ -315,10 +315,10 @@ Purpose: same as above, but also computes **velocity** on the PC (ticks/s) from 
 
 Notes:
 - Velocity is computed from successive samples; it benefits from smoothing.
-- Use an EWMA/low-pass (alpha ~ 0.15â0.4) if the derivative looks noisy.
+- Use an EWMA/low-pass (alpha ~ 0.15 .. 0.4) if the derivative looks noisy.
 
 ### `plot_motor_debug.py`
-Purpose: âbring-upâ tool: prints raw RX lines and verifies that TX commands are accepted.
+Purpose: 'bring-up' tool: prints raw RX lines and verifies that TX commands are accepted.
 
 Use this when:
 - you suspect the port is wrong
@@ -359,10 +359,10 @@ The Arduino Uno has **2KB of RAM**, so memory budgeting matters. UniProto is des
 ### Practical rules of thumb
 - Prefer **one module at a time** on Uno when experimenting.
 - If the Uno resets when printing `?` or enabling streams, it is often a **RAM crash**.
-- Keep `UNIPROTO_MAX_PARAMS` as low as practical (e.g. 16â20) on Uno.
+- Keep `UNIPROTO_MAX_PARAMS` as low as practical (e.g. 16-20) on Uno.
 - Reduce block sizes on Uno:
   - `ADC_BLOCK_LEN=300` (or smaller)
-- Limit ADC channels on Uno when you donât need all of them.
+- Limit ADC channels on Uno when you don't need all of them.
 
 ### Recommended PlatformIO build flags (Uno)
 Use `build_flags` to tune RAM:
@@ -378,11 +378,11 @@ build_flags =
 ```
 
 ### How to verify remaining RAM
-- Use PlatformIOâs âAdvanced Memory Usageâ report
+- Use PlatformIO's 'Advanced Memory Usage' report
 - Optionally add a small `freeRam()` helper (AVR) and print it once at startup
 
 If you need more headroom:
-- remove unused modules from the build (donât compile/register them)
+- remove unused modules from the build (don't compile/register them)
 - reduce tables/buffers via build flags
 - avoid `String` and dynamic allocations
 
