@@ -339,6 +339,9 @@ Notes:
 - Block streams only emit a frame once the internal buffer is full.
 - On AVR, keep block length and sample rate conservative.
 
+The minimal invocation to run these examples: 
+    python3 plot_motor_stream.py --port /dev/tty.usbmodem1101
+
 ---
 
 ## Memory use (AVR / Uno guidance)
@@ -390,7 +393,7 @@ If you need more headroom:
 
 ## Implemented modules
 ### mechanical design
-The mechanical design consists of a base-plate of 3mm acrylic, which hosts a standard Arduino (Uno) board on one side and a specific sensor on the other side. The [boards.svg](design/boards.svg) file includes all (current) designs. For some sensors a small mounting block is printed. These are designed in openscad and can be found in the [design](design) folder.
+The mechanical design consists of a base-plate of 3mm acrylic, which hosts a standard Arduino (Uno) board on one side and a specific sensor on the other side. The [boards.svg](design/baseplates.svg) file includes all (current) designs. For some sensors a small mounting block is printed. These are designed in openscad and can be found in the [design](design) folder.
 
 ### ADC
 The adc module will give standard streams of analogRead, in a specific format (txt, bin, ap, csv) and at a certain rate. Default streams are configured in the [mod_adc.h](lib/modules/mod_adc.h) file. They can be overwritten in the [main.cpp](src/main.cpp)
