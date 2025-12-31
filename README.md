@@ -449,6 +449,9 @@ Tune calibration (if needed):
     !psd.cal_a:137.5
     !psd.cal_b:1.125
 
+### BLDC
+This module uses a small 14-pole BLDC motor (BDU A V 2204-260kV) with an AS5600 magnetic encoder, controlled by a M5-stack BLDC controller. 
+
 
 
 ## TODO

@@ -577,14 +577,19 @@ void BldcModule::driverEnable(bool en) {
 void BldcModule::driverApplyExternalEffort(int16_t effort) {
   effort = clampCmd(effort);
 
-  uint8_t dir = (effort < 0) ? 1 : 0;
+  // Map signed effort -> dir + pwmTarget
+  uint8_t dirTarget = (effort < 0) ? 1 : 0;
   uint16_t mag = (uint16_t)abs(effort);
 
-  // scale effort -> pwm (0..pwmMax)
   const int16_t lim = (int16_t)abs(_cfg.cmdLimit);
-  uint16_t pwm = 0;
-  if (lim > 0) pwm = (uint16_t)((uint32_t)mag * (uint32_t)_cfg.pwmMax / (uint32_t)lim);
-  if (pwm > 2047) pwm = 2047;
+  uint16_t pwmTarget = 0;
+  if (lim > 0) pwmTarget = (uint16_t)((uint32_t)mag * (uint32_t)_cfg.pwmMax / (uint32_t)lim);
+  if (pwmTarget > 2047) pwmTarget = 2047;
+
+  // Slew step per call (tune: 10..100 typical on Uno)
+  uint16_t step = _cfg.pwmSlewPerTick;
+  if (step < 1) step = 1;
+  if (step > 2047) step = 2047;
 
   if (_cfg.proto == Config::DriverProto::V1_ADDR_0x65) {
 
@@ -592,43 +597,68 @@ void BldcModule::driverApplyExternalEffort(int16_t effort) {
     if (_v1_lastMode != 0) {
       drvV1_setMode(0);
       _v1_lastMode = 0;
-      _v1_lastDir = 255;
-      _v1_lastPwm = 0xFFFF;
+      _v1_lastDir  = 255;
+      _v1_lastPwm  = 0xFFFF;
     }
 
-    // ---- Safe direction change ----
-    // If direction changes while PWM is nonzero, many drivers ignore it unless PWM==0.
-    if (_v1_lastDir != 255 && dir != _v1_lastDir) {
-      if (_v1_lastPwm != 0 && _v1_lastPwm != 0xFFFF) {
-        drvV1_setOpenLoopPwm(0);
-        _v1_lastPwm = 0;
-        delayMicroseconds(300); // small dead-time
-      }
-      drvV1_setDirection(dir);
-      _v1_lastDir = dir;
-      delayMicroseconds(300);   // small dead-time
-      // fall through to write pwm below
-    } else {
-      // Direction not set yet, or unchanged
-      if (_v1_lastDir == 255) {
-        drvV1_setDirection(dir);
-        _v1_lastDir = dir;
-      }
+    // Ensure direction is initialized
+    if (_v1_lastDir == 255) {
+      drvV1_setDirection(dirTarget);
+      _v1_lastDir = dirTarget;
+      _v1_lastPwm = 0;      // assume stopped until we write
+      drvV1_setOpenLoopPwm(0);
     }
 
-    // PWM update (only if changed)
-    if (pwm != _v1_lastPwm) {
-      drvV1_setOpenLoopPwm(pwm);
-      _v1_lastPwm = pwm;
+    // If direction needs to change:
+    // 1) ramp PWM down to 0
+    // 2) flip direction (only at 0)
+    // 3) ramp up toward new target
+    if (dirTarget != _v1_lastDir) {
+      // ramp down
+      if (_v1_lastPwm == 0xFFFF) _v1_lastPwm = 0;
+
+      if (_v1_lastPwm > 0) {
+        uint16_t newPwm = (_v1_lastPwm > step) ? (_v1_lastPwm - step) : 0;
+        if (newPwm != _v1_lastPwm) {
+          drvV1_setOpenLoopPwm(newPwm);
+          _v1_lastPwm = newPwm;
+        }
+        return; // keep ramping down on subsequent ticks
+      }
+
+      // now at 0 -> flip
+      drvV1_setDirection(dirTarget);
+      _v1_lastDir = dirTarget;
+
+      // keep pwm at 0 this tick; next ticks ramp up
+      return;
+    }
+
+    // Same direction: ramp toward target
+    if (_v1_lastPwm == 0xFFFF) _v1_lastPwm = 0;
+
+    uint16_t newPwm = _v1_lastPwm;
+    if (pwmTarget > _v1_lastPwm) {
+      uint16_t up = pwmTarget - _v1_lastPwm;
+      newPwm = _v1_lastPwm + ((up > step) ? step : up);
+    } else if (pwmTarget < _v1_lastPwm) {
+      uint16_t dn = _v1_lastPwm - pwmTarget;
+      newPwm = _v1_lastPwm - ((dn > step) ? step : dn);
+    }
+
+    if (newPwm != _v1_lastPwm) {
+      drvV1_setOpenLoopPwm(newPwm);
+      _v1_lastPwm = newPwm;
     }
 
     return;
   }
 
-  // (V2 path unchanged)
+  // V2 (unchanged placeholder)
   drvV2_setMode(1);
   drvV2_setSpeedX100((int32_t)(effort * 10));
 }
+
 
 
 

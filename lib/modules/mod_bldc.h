@@ -24,6 +24,7 @@ public:
     // Motor specifics
     uint8_t polePairs = 7; // 14 poles -> 7 pole pairs
 
+    uint16_t pwmSlewPerTick = 30; // max pwm change per control tick (0..2047)
     // ---- Stream ----
     uint8_t streamId = 6;
     const char* streamName = "bldc";
@@ -40,7 +41,7 @@ public:
     int16_t  cmdLimit = 255;   // your internal effort command range
 
     // optional inversion
-    bool invert = false;
+    bool invert = true;
   };
 
   static Config defaultUno() { return Config{}; }
