@@ -3,6 +3,8 @@
 #include <Wire.h>
 #include "UniProto.h"
 
+
+
 class BldcModule {
 public:
   struct Config {
@@ -40,11 +42,33 @@ public:
     uint16_t pwmMax = 2047;
     int16_t  cmdLimit = 255;   // your internal effort command range
 
+
+
+    
     // optional inversion
     bool invert = true;
   };
 
-  static Config defaultUno() { return Config{}; }
+  static Config defaultUno() {
+  Config c{};                 // start from the struct defaults
+
+  // --- your hardware defaults ---
+  c.as5600Addr = 0x36;
+  // c.invert = true;
+
+  c.proto = Config::DriverProto::V1_ADDR_0x65;
+  c.driverAddrV1 = 0x65;
+  c.driverAddrV2 = 0x64;
+
+  c.polePairs = 7;
+  c.controlHz = 500;
+
+  // optional: stream defaults if you want
+   c.streamId = 6;  
+   c.streamName = "bldc";
+
+  return c;
+}
 
   explicit BldcModule(const Config& cfg);
 
@@ -174,3 +198,18 @@ uint16_t _v1_lastPwm  = 0xFFFF;
   void driverApplySpeedRpm(float rpm);
   void driverApplyPosition(float posUser);
 };
+
+
+// (optional) quick I2C scan for bring-up
+static void i2cScan() {
+  Serial.println(F("I2C scan..."));
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.print(F(" 0x"));
+      if (addr < 16) Serial.print('0');
+      Serial.println(addr, HEX);
+    }
+  }
+  Serial.println(F("Done."));
+}
