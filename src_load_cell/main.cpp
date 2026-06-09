@@ -1,84 +1,40 @@
 #include <Arduino.h>
 #include "UniProto.h"
+#include "mod_hx711.h"
 
 // ── Device ────────────────────────────────────────────────────────────────────
-// Load cell with HX711 24-bit ADC amplifier.
-// HX711: DOUT=A1, SCK=A0.  Gain: 128 (ch A).
+// One or two HX711 load cell amplifiers.
+// Each has its own stream, scale, and tare — calibrate independently.
 //
-// TODO: create lib/modules/mod_hx711.h/.cpp  (shared with pneumatic, kitchen_scales)
-//       Until then this sketch uses a minimal inline HX711 read.
+// Load cell 1 (default):  DOUT=A1, SCK=A0  → stream 1, prefix "hx"
+// Load cell 2 (optional): DOUT=A3, SCK=A2  → stream 2, prefix "hx2"
 //
-// Stream 1:  raw HX711 count (i32) + tared grams (f32)
-// Params:
-//   !hx.tare:1                 capture tare zero
-//   !hx.scale:0.001            counts-per-gram factor (calibrate with known weight)
-//   !hx.gain:128               128 or 64 (ch A) or 32 (ch B)
+// To use only one load cell: comment out hx2 lines below.
+//
+// ── Calibration procedure ────────────────────────────────────────────────────
+// 1. Flash and open visualiser
+// 2. Remove all weight from load cell
+// 3. Click "zero hx" (or send !hx.zero:1) — captures tare
+// 4. Place a known weight (e.g. 500g)
+// 5. Read the raw value: ?hx.raw
+// 6. Calculate: scale = (raw - tare) / known_weight_in_grams
+//    e.g. if raw-tare = 412500 and weight = 500g → scale = 825.0
+// 7. Send !hx.scale:825.0
+// 8. Verify the reading matches the known weight
+// 9. Repeat steps 2-8 for hx2 if using two cells
 // ─────────────────────────────────────────────────────────────────────────────
-
-#define HX_DOUT A1
-#define HX_SCK  A0
 
 UniProto proto(Serial, "LoadCell");
 
-static int32_t  _tare  = 0;
-static float    _scale = 0.001f;   // counts per gram — calibrate!
-static int32_t  _last  = 0;
-
-// --- minimal HX711 read (no library) ---
-static bool hxReady() {
-    return digitalRead(HX_DOUT) == LOW;
-}
-static int32_t hxRead() {
-    uint32_t raw = 0;
-    for (int i = 0; i < 24; i++) {
-        digitalWrite(HX_SCK, HIGH);
-        raw = (raw << 1) | digitalRead(HX_DOUT);
-        digitalWrite(HX_SCK, LOW);
-    }
-    // one extra pulse → gain 128 ch A
-    digitalWrite(HX_SCK, HIGH);
-    digitalWrite(HX_SCK, LOW);
-    // sign extend 24-bit
-    if (raw & 0x800000) raw |= 0xFF000000;
-    return (int32_t)raw;
-}
-
-// ---- emit ----
-static void emitLoad(UniProto& p, uint8_t sid, UniFrameWriter& w, void* /*ctx*/) {
-    if (hxReady()) _last = hxRead();
-    const float g = (_last - _tare) * _scale;
-    w.begin(sid);
-    w.i32(_last, "raw");
-    w.f32(g, "g", 2);
-    w.end();
-}
-
-// ---- params ----
-static bool getHx(UniProto&, const char* key, char* out, size_t outLen, void* /*ctx*/) {
-    if (!strcmp(key, "hx.scale")) { snprintf(out, outLen, "%.6f", (double)_scale); return true; }
-    if (!strcmp(key, "hx.tare"))  { snprintf(out, outLen, "%ld",  (long)_tare);   return true; }
-    return false;
-}
-static bool setHx(UniProto&, const char* key, const char* value, void* /*ctx*/) {
-    if (!strcmp(key, "hx.scale")) { _scale = UniProto::parseFloat(value); return true; }
-    if (!strcmp(key, "hx.tare"))  {
-        if (UniProto::parseInt(value)) _tare = _last; // capture current as zero
-        return true;
-    }
-    return false;
-}
+Hx711Module hx(Hx711Module::defaultUno());   // DOUT=A1, SCK=A0
+Hx711Module hx2(Hx711Module::defaultUno2()); // DOUT=A3, SCK=A2
 
 void setup() {
-    pinMode(HX_DOUT, INPUT);
-    pinMode(HX_SCK,  OUTPUT);
-    digitalWrite(HX_SCK, LOW);
-
     Serial.begin(115200);
     proto.begin();
-    proto.setRateHz(10);
-    proto.registerStream({1, "load", "i32,f32", "raw,g", emitLoad, nullptr});
-    proto.registerParam({"hx.scale", UniProto::ParamType::FLOAT, getHx, setHx, nullptr});
-    proto.registerParam({"hx.tare",  UniProto::ParamType::BOOL,  getHx, setHx, nullptr});
+    proto.setRateHz(5);   // 5 Hz default — HX711 is 10 SPS at normal rate
+    hx.registerWith(proto);
+    hx2.registerWith(proto);
 }
 
 void loop() {
