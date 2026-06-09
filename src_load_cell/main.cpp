@@ -3,40 +3,40 @@
 #include "mod_hx711.h"
 
 // ── Device ────────────────────────────────────────────────────────────────────
-// One or two HX711 load cell amplifiers.
-// Each has its own stream, scale, and tare — calibrate independently.
-//
-// Load cell 1 (default):  DOUT=A1, SCK=A0  → stream 1, prefix "hx"
-// Load cell 2 (optional): DOUT=A3, SCK=A2  → stream 2, prefix "hx2"
-//
-// To use only one load cell: comment out hx2 lines below.
+// Single HX711 load cell amplifier, channel A (gain 128).
+// DOUT=A3, SCK=A2
 //
 // ── Calibration procedure ────────────────────────────────────────────────────
-// 1. Flash and open visualiser
-// 2. Remove all weight from load cell
-// 3. Click "zero hx" (or send !hx.zero:1) — captures tare
-// 4. Place a known weight (e.g. 500g)
-// 5. Read the raw value: ?hx.raw
-// 6. Calculate: scale = (raw - tare) / known_weight_in_grams
-//    e.g. if raw-tare = 412500 and weight = 500g → scale = 825.0
-// 7. Send !hx.scale:825.0
-// 8. Verify the reading matches the known weight
-// 9. Repeat steps 2-8 for hx2 if using two cells
+// 1. Flash and open plot_load_cell.py
+// 2. Remove all weight → click "zero" (captures tare)
+// 3. Place a known weight (e.g. 500 g)
+// 4. Enter known weight in box → click "calc scale"
+// 5. Click "verify" to confirm
 // ─────────────────────────────────────────────────────────────────────────────
 
 UniProto proto(Serial, "LoadCell");
 
-Hx711Module hx(Hx711Module::defaultUno());   // DOUT=A1, SCK=A0
-Hx711Module hx2(Hx711Module::defaultUno2()); // DOUT=A3, SCK=A2
+static Hx711Module::Config makeCfg() {
+    auto c = Hx711Module::defaultUno2();  // DOUT=A3, SCK=A2
+    c.gain       = 128;
+    c.avgCount   = 4;
+    c.streamId   = 1;
+    c.streamName = "load";
+    c.units      = "raw,g";
+    c.prefix     = "hx";   // use "hx" not "hx2"
+    return c;
+}
+
+Hx711Module hx(makeCfg());
 
 void setup() {
     Serial.begin(115200);
     proto.begin();
-    proto.setRateHz(5);   // 5 Hz default — HX711 is 10 SPS at normal rate
+    proto.setRateHz(10);
     hx.registerWith(proto);
-    hx2.registerWith(proto);
 }
 
 void loop() {
+    hx.poll();    // non-blocking averaging accumulation
     proto.tick();
 }

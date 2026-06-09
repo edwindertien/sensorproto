@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-HX711 load cell — live monitor + calibration panel.
-
-Supports two load cells (hx and hx2) simultaneously.
-Calibration procedure is guided via the control panel.
+HX711 load cell — live monitor + calibration.
+Single cell, stream 1, prefix "hx".
 
 Usage:
   python plot_load_cell.py --port /dev/tty.usbmodemXXXX
-  python plot_load_cell.py --port /dev/tty.usbmodemXXXX --units N --rate 5
+  python plot_load_cell.py --port /dev/tty.usbmodemXXXX --units g
 """
 import argparse
 import time
@@ -20,11 +18,9 @@ import matplotlib.gridspec as gridspec
 from matplotlib.widgets import TextBox, Button
 import serial
 
-# ── serial ────────────────────────────────────────────────────────────────────
-
 def write_cmd(ser, s):
-    if not s.endswith("\n"):
-        s += "\n"
+    s = s.strip()  # remove any \r, \n, spaces
+    s += "\n"     # add exactly one \n
     ser.write(s.encode("ascii", errors="ignore"))
     ser.flush()
 
@@ -34,25 +30,13 @@ def send_and_wait(ser, cmd, pause=0.15):
     while ser.in_waiting:
         ser.readline()
 
-def parse_stream(line):
-    """raw(i32), value(f32)"""
-    parts = [p.strip() for p in line.split(",")]
-    if len(parts) != 2:
-        return None
-    try:
-        return int(parts[0]), float(parts[1])
-    except ValueError:
-        return None
-
-# ── main ──────────────────────────────────────────────────────────────────────
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port",   required=True)
-    ap.add_argument("--baud",   type=int,   default=115200)
-    ap.add_argument("--rate",   type=int,   default=5)
-    ap.add_argument("--chart",  type=int,   default=120)
-    ap.add_argument("--units",  default="g", help="unit label for Y axis (g, N, kg)")
+    ap.add_argument("--port",  required=True)
+    ap.add_argument("--baud",  type=int, default=115200)
+    ap.add_argument("--rate",  type=int, default=10)
+    ap.add_argument("--chart", type=int, default=200)
+    ap.add_argument("--units", default="g")
     args = ap.parse_args()
 
     print(f"[INFO] Opening {args.port} @ {args.baud}")
@@ -62,119 +46,108 @@ def main():
     send_and_wait(ser, "!format:csv")
     send_and_wait(ser, "!timestamp:0")
     send_and_wait(ser, f"!rate:{args.rate}")
-    # enable both streams
-    send_and_wait(ser, "!stream:+1")
-    send_and_wait(ser, "!stream:+2")
+    send_and_wait(ser, "!stream:1")
     ser.reset_input_buffer()
     print("[INFO] Ready.")
 
-    # ── state ─────────────────────────────────────────────────────────────────
-    N = args.chart
-    val1_buf = deque([0.0]*N, maxlen=N)
-    val2_buf = deque([0.0]*N, maxlen=N)
-    raw1_last = 0
-    raw2_last = 0
-    val1_last = 0.0
-    val2_last = 0.0
-
-    # calibration state per cell
-    tare_raw = [0, 0]       # captured tare counts
-    cal_raw  = [0, 0]       # captured counts at known weight
-    cal_done = [False, False]
+    # ── state — use lists so closures always see current value ────────────────
+    N        = args.chart
+    raw_buf  = deque([0]*N, maxlen=N)
+    val_buf  = deque([0.0]*N, maxlen=N)
+    last_raw = [0]      # list so callbacks see live value
+    last_val = [0.0]    # list so callbacks see live value
+    tare_raw = [0]
 
     # ── figure ────────────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(14, 7))
-    fig.suptitle("HX711 load cell monitor + calibration", fontsize=11)
+    fig = plt.figure(figsize=(13, 6))
+    fig.suptitle("HX711 load cell — monitor + calibration", fontsize=11)
 
-    gs = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[2.5, 1.2], wspace=0.35)
-    ax_val = fig.add_subplot(gs[0])
-    ax_pan = fig.add_subplot(gs[1])
+    gs = gridspec.GridSpec(2, 2, figure=fig,
+                           width_ratios=[2.8, 1.0],
+                           height_ratios=[1, 1],
+                           wspace=0.35, hspace=0.4)
+
+    ax_raw = fig.add_subplot(gs[0, 0])
+    ax_val = fig.add_subplot(gs[1, 0])
+    ax_pan = fig.add_subplot(gs[:, 1])
     ax_pan.set_visible(False)
 
     t_ax = list(range(-N, 0))
-    v1l, = ax_val.plot(t_ax, list(val1_buf), color="steelblue", lw=1.0, label=f"cell 1 ({args.units})")
-    v2l, = ax_val.plot(t_ax, list(val2_buf), color="tomato",    lw=1.0, label=f"cell 2 ({args.units})")
+
+    raw_line,  = ax_raw.plot(t_ax, list(raw_buf), color="steelblue", lw=0.8)
+    tare_hline = ax_raw.axhline(0, color="tomato", lw=0.8, ls="--", label="tare")
+    ax_raw.set_ylabel("raw counts")
+    ax_raw.set_xlabel("samples")
+    ax_raw.grid(True, alpha=0.3)
+    ax_raw.legend(fontsize=7, loc="upper left")
+
+    val_line,  = ax_val.plot(t_ax, list(val_buf), color="mediumseagreen", lw=0.9)
     ax_val.axhline(0, color="gray", lw=0.5)
     ax_val.set_ylabel(f"weight ({args.units})")
     ax_val.set_xlabel("samples")
-    ax_val.legend(loc="upper left", fontsize=8)
     ax_val.grid(True, alpha=0.3)
 
     status = fig.text(0.01, 0.01,
-        "cell1: raw=-- val=--   cell2: raw=-- val=--",
-        fontsize=7.5, family="monospace", color="0.35")
+        "raw=--  tared=--  val=--",
+        fontsize=8, family="monospace", color="0.35")
 
     plt.tight_layout(rect=[0, 0.04, 1, 0.96])
 
     # ── control panel ─────────────────────────────────────────────────────────
-    PX = 0.655
-    PW = 0.32
-    BH = 0.042
-    BG = 0.006
-    TY = 0.88
+    PX = 0.735
+    PW = 0.24
+    BH = 0.055
+    BG = 0.008
 
-    fig.text(PX, TY + BH + 0.012, "Send command:", fontsize=8, va="bottom")
-    ax_tb = fig.add_axes([PX, TY, PW, BH])
-    textbox = TextBox(ax_tb, "", initial="!hx.scale:825.0")
+    def label(text, y):
+        fig.text(PX, y, text, fontsize=7.5, fontweight="bold", color="0.35")
 
-    y = TY - BH - BG
-    ax_send = fig.add_axes([PX, y, PW, BH])
-    btn_send = Button(ax_send, "Send", color="0.85", hovercolor="0.70")
-
-    # ── calibration section ───────────────────────────────────────────────────
-    def section(label, ypos):
-        fig.text(PX, ypos, label, fontsize=7.5, fontweight="bold", color="0.3")
-
-    def btn(label, ypos, w_frac=1.0, x_off=0.0, color="0.88"):
-        ax_b = fig.add_axes([PX + x_off*PW, ypos, PW*w_frac - 0.004, BH*0.9])
-        b = Button(ax_b, label, color=color, hovercolor="0.72")
-        b.label.set_fontsize(7.5)
+    def mkbtn(text, y, color="0.88", w=1.0, xoff=0.0):
+        ax_b = fig.add_axes([PX + xoff*PW, y, PW*w - 0.003, BH*0.85])
+        b = Button(ax_b, text, color=color, hovercolor="0.72")
+        b.label.set_fontsize(8)
         return b
 
-    y -= BH + BG * 3
-    section("── cell 1 (hx) ──", y + BH * 0.3)
+    y = 0.84
+    label("── send ──", y + BH*0.1);        y -= BH*0.6
+    ax_tb   = fig.add_axes([PX, y, PW, BH*0.9])
+    textbox = TextBox(ax_tb, "", initial="!hx.avg:4")
+    y -= BH + BG
+    btn_send = mkbtn("Send", y, color="0.82"); y -= BH + BG*3
+
+    label("── calibration ──", y + BH*0.1); y -= BH*0.6
+    btn_zero   = mkbtn("1.  zero  (no weight)", y);  y -= BH + BG
+    btn_cap    = mkbtn("2.  capture tare",       y);  y -= BH + BG
+
+    ax_kw = fig.add_axes([PX, y, PW*0.58, BH*0.85])
+    tb_kw = TextBox(ax_kw, "", initial="500")
+    fig.text(PX + PW*0.61, y + BH*0.25, f"known ({args.units})", fontsize=7.5)
     y -= BH + BG
 
-    b1_zero  = btn("1. zero  (remove weight)", y);          y -= BH + BG
-    b1_cap   = btn("2. capture tare raw",       y);          y -= BH + BG
-    ax_kw1   = fig.add_axes([PX, y, PW*0.55, BH])
-    tb_kw1   = TextBox(ax_kw1, "", initial="500")
-    fig.text(PX + PW*0.57, y + BH*0.3, f"known ({args.units})", fontsize=7)
-    y -= BH + BG
-    b1_cal   = btn("3. place weight + calc scale", y, color="0.80"); y -= BH + BG
-    b1_verify= btn("4. verify / show scale",       y);                y -= BH + BG * 3
+    btn_cal    = mkbtn("3.  calc scale", y, color="0.78"); y -= BH + BG
+    btn_verify = mkbtn("4.  verify",     y);                y -= BH + BG*3
 
-    section("── cell 2 (hx2) ──", y + BH * 0.3)
+    label("── rate ──", y + BH*0.1);        y -= BH*0.6
+    btn_r10  = mkbtn("10 Hz", y, w=0.48)
+    btn_r2   = mkbtn("2 Hz",  y, w=0.48, xoff=0.52)
     y -= BH + BG
 
-    b2_zero  = btn("1. zero  (remove weight)", y);          y -= BH + BG
-    b2_cap   = btn("2. capture tare raw",       y);          y -= BH + BG
-    ax_kw2   = fig.add_axes([PX, y, PW*0.55, BH])
-    tb_kw2   = TextBox(ax_kw2, "", initial="500")
-    fig.text(PX + PW*0.57, y + BH*0.3, f"known ({args.units})", fontsize=7)
+    label("── avg ──", y + BH*0.1);         y -= BH*0.6
+    btn_a1   = mkbtn("avg 1",  y, w=0.31,        xoff=0.0)
+    btn_a4   = mkbtn("avg 4",  y, w=0.31,        xoff=0.35)
+    btn_a16  = mkbtn("avg 16", y, w=0.31,        xoff=0.69)
     y -= BH + BG
-    b2_cal   = btn("3. place weight + calc scale", y, color="0.80"); y -= BH + BG
-    b2_verify= btn("4. verify / show scale",       y);                y -= BH + BG * 3
 
-    section("── both cells ──", y + BH * 0.3)
-    y -= BH + BG
-    b_rate_lo = btn("rate 2 Hz",  y, 0.48)
-    b_rate_hi = btn("rate 10 Hz", y, 0.48, 0.52)
-    y -= BH + BG
-    b_avg4    = btn("avg 4",  y, 0.48)
-    b_avg16   = btn("avg 16", y, 0.48, 0.52)
-
-    # log
-    LOG_H = 0.08
-    ax_log = fig.add_axes([PX, 0.02, PW, LOG_H])
+    # log strip
+    ax_log = fig.add_axes([PX, 0.02, PW, 0.10])
     ax_log.axis("off")
     log_lines = [""] * 4
-    log_text = ax_log.text(0, 1, "", fontsize=6.5, va="top", family="monospace")
+    log_text  = ax_log.text(0, 1, "", fontsize=6.5, va="top", family="monospace")
 
     def log(msg):
         print(msg)
         log_lines.pop(0)
-        log_lines.append(msg[:46])
+        log_lines.append(msg[:38])
         log_text.set_text("\n".join(log_lines))
         fig.canvas.draw_idle()
 
@@ -183,77 +156,60 @@ def main():
         log(f">>> {cmd}")
 
     # ── callbacks ─────────────────────────────────────────────────────────────
-
+    _pending = [False]
     def do_send(text):
-        if text.strip(): send(text.strip())
-    textbox.on_submit(do_send)
-    btn_send.on_clicked(lambda e: do_send(textbox.text))
+        cmd = text.strip()
+        if not cmd or _pending[0]:
+            return
+        _pending[0] = True
+        send(cmd)
+    def on_submit(text):
+        do_send(text)
+        _pending[0] = False
+    def on_btn_send(e):
+        _pending[0] = False   # reset so button always works
+        do_send(textbox.text)
+        _pending[0] = False
+    textbox.on_submit(on_submit)
+    btn_send.on_clicked(on_btn_send)
 
-    # Cell 1
-    def cb_1_zero(e):
+    def cb_zero(e):
         send("!hx.zero:1")
-        tare_raw[0] = raw1_last
-        log(f"  tare captured: {tare_raw[0]}")
-    def cb_1_cap(e):
-        tare_raw[0] = raw1_last
-        log(f"  tare raw = {tare_raw[0]}")
-    def cb_1_cal(e):
+        tare_raw[0] = last_raw[0]
+        tare_hline.set_ydata([last_raw[0], last_raw[0]])
+        log(f"  tare = {tare_raw[0]}")
+
+    def cb_cap(e):
+        tare_raw[0] = last_raw[0]
+        tare_hline.set_ydata([last_raw[0], last_raw[0]])
+        log(f"  tare = {tare_raw[0]}")
+
+    def cb_cal(e):
         try:
-            kw = float(tb_kw1.text.strip())
+            kw = float(tb_kw.text.strip())
         except ValueError:
-            log("  ! enter a valid known weight"); return
-        cal_raw[0] = raw1_last
-        delta = cal_raw[0] - tare_raw[0]
-        if abs(delta) < 100:
-            log("  ! reading too close to tare — add weight first"); return
+            log("  ! invalid weight value"); return
+        delta = last_raw[0] - tare_raw[0]
+        if abs(delta) < 500:
+            log(f"  ! delta={delta} too small — add weight"); return
         scale = delta / kw
         send(f"!hx.scale:{scale:.4f}")
-        log(f"  scale = {delta}/{kw:.1f} = {scale:.4f}")
-        cal_done[0] = True
-    def cb_1_verify(e):
+        log(f"  {delta}/{kw:.1f} = {scale:.4f}")
+
+    def cb_verify(e):
         send("?hx.scale")
-        log(f"  raw={raw1_last}  val={val1_last:.3f} {args.units}")
+        log(f"  raw={last_raw[0]}  val={last_val[0]:.3f} {args.units}")
 
-    b1_zero.on_clicked(cb_1_zero)
-    b1_cap.on_clicked(cb_1_cap)
-    b1_cal.on_clicked(cb_1_cal)
-    b1_verify.on_clicked(cb_1_verify)
+    btn_zero.on_clicked(cb_zero)
+    btn_cap.on_clicked(cb_cap)
+    btn_cal.on_clicked(cb_cal)
+    btn_verify.on_clicked(cb_verify)
 
-    # Cell 2
-    def cb_2_zero(e):
-        send("!hx2.zero:1")
-        tare_raw[1] = raw2_last
-        log(f"  tare captured: {tare_raw[1]}")
-    def cb_2_cap(e):
-        tare_raw[1] = raw2_last
-        log(f"  tare raw = {tare_raw[1]}")
-    def cb_2_cal(e):
-        try:
-            kw = float(tb_kw2.text.strip())
-        except ValueError:
-            log("  ! enter a valid known weight"); return
-        cal_raw[1] = raw2_last
-        delta = cal_raw[1] - tare_raw[1]
-        if abs(delta) < 100:
-            log("  ! reading too close to tare — add weight first"); return
-        scale = delta / kw
-        send(f"!hx2.scale:{scale:.4f}")
-        log(f"  scale = {delta}/{kw:.1f} = {scale:.4f}")
-        cal_done[1] = True
-    def cb_2_verify(e):
-        send("?hx2.scale")
-        log(f"  raw={raw2_last}  val={val2_last:.3f} {args.units}")
-
-    b2_zero.on_clicked(cb_2_zero)
-    b2_cap.on_clicked(cb_2_cap)
-    b2_cal.on_clicked(cb_2_cal)
-    b2_verify.on_clicked(cb_2_verify)
-
-    # Both
-    b_rate_lo.on_clicked(lambda e: send("!rate:2"))
-    b_rate_hi.on_clicked(lambda e: send("!rate:10"))
-    b_avg4.on_clicked(lambda e:  [send("!hx.avg:4"),  send("!hx2.avg:4")])
-    b_avg16.on_clicked(lambda e: [send("!hx.avg:16"), send("!hx2.avg:16")])
+    btn_r10.on_clicked(lambda e: send("!rate:10"))
+    btn_r2.on_clicked( lambda e: send("!rate:2"))
+    btn_a1.on_clicked( lambda e: send("!hx.avg:1"))
+    btn_a4.on_clicked( lambda e: send("!hx.avg:4"))
+    btn_a16.on_clicked(lambda e: send("!hx.avg:16"))
 
     plt.show(block=False)
     plt.pause(0.05)
@@ -262,19 +218,6 @@ def main():
     rxbuf     = b""
     last_draw = time.time()
     new_data  = False
-
-    # track which stream last line came from via context
-    # UniProto CSV doesn't prepend stream id — we rely on the fact that
-    # stream 1 and 2 both emit the same format; we distinguish by watching
-    # the raw value jump patterns. A simpler approach: enable streams one
-    # at a time and log separately. But with two identical-format streams
-    # interleaved we need a counter trick:
-    # stream 1 and 2 alternate if both enabled at same rate.
-    # We tag by enabling timestamps and parsing, OR by toggling streams.
-    # Simplest robust approach: enable only one stream at a time via the panel,
-    # OR add a stream-id prefix by using !format:txt temporarily.
-    # For now: the two streams alternate, track by line parity.
-    line_counter = 0
 
     try:
         while plt.fignum_exists(fig.number):
@@ -285,34 +228,36 @@ def main():
             while b"\n" in rxbuf:
                 line_b, rxbuf = rxbuf.split(b"\n", 1)
                 line = line_b.decode("utf-8", errors="ignore").strip()
-                if not line or line.startswith(("{", "OK", "ERR", "rate",
-                                                "format", "stream", "hx")):
+                if not line:
                     continue
-                parsed = parse_stream(line)
-                if parsed is None:
+                # Log any non-data response (OK, ERR, param replies, tare=...)
+                if not line[0].lstrip("-").isdigit():
+                    log(f"  {line}")
                     continue
-
-                raw, val = parsed
-                line_counter += 1
-                # streams alternate 1,2,1,2... when both enabled at same rate
-                if line_counter % 2 == 1:
-                    raw1_last = raw; val1_last = val
-                    val1_buf.append(val)
-                else:
-                    raw2_last = raw; val2_last = val
-                    val2_buf.append(val)
-                new_data = True
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) != 2:
+                    continue
+                try:
+                    last_raw[0] = int(parts[0])
+                    last_val[0] = float(parts[1])
+                    raw_buf.append(last_raw[0])
+                    val_buf.append(last_val[0])
+                    new_data = True
+                except ValueError:
+                    pass
 
             now = time.time()
-            if new_data and (now - last_draw) >= 0.05:
+            if new_data and (now - last_draw) >= 0.04:
                 last_draw = now; new_data = False
                 t_ax = list(range(-N, 0))
-                v1l.set_data(t_ax, list(val1_buf))
-                v2l.set_data(t_ax, list(val2_buf))
+                raw_line.set_data(t_ax, list(raw_buf))
+                val_line.set_data(t_ax, list(val_buf))
+                ax_raw.relim(); ax_raw.autoscale_view()
                 ax_val.relim(); ax_val.autoscale_view()
+                tared = last_raw[0] - tare_raw[0]
                 status.set_text(
-                    f"cell1: raw={raw1_last:+9d}  val={val1_last:8.3f} {args.units}    "
-                    f"cell2: raw={raw2_last:+9d}  val={val2_last:8.3f} {args.units}"
+                    f"raw={last_raw[0]:+10d}   tared={tared:+10d}   "
+                    f"val={last_val[0]:8.3f} {args.units}"
                 )
                 fig.canvas.draw_idle()
                 fig.canvas.flush_events()

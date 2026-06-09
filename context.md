@@ -184,6 +184,20 @@ a reader script will be used, as they set it themselves on connect.
 - `plot_dual_motor.py` has integrated command panel (send box + preset buttons)
   so no second serial terminal is needed during tuning.
 
+### HX711 bring-up issues (load_cell)
+
+- **Wrong param prefix**: `defaultUno2()` sets `prefix="hx2"`, so params registered
+  as `hx2.scale`, `hx2.tare` etc. Override with `c.prefix = "hx"` in `makeCfg()`.
+- **Blocking reads stall serial**: `readAvg(4)` with 100ms timeout per sample = 400ms
+  blocking per emit at 10Hz. Incoming commands dropped during that window.
+  Fix: non-blocking `readOnce()` returns stale if DOUT not ready; averaging done
+  in `poll()` via `loop()`.
+- **TextBox double-fire**: matplotlib TextBox `on_submit` fires on both Enter keypress
+  and focus-loss. Added `_pending` flag to suppress duplicate sends.
+- **Non-data responses swallowed**: receive loop only parsed lines with exactly 2
+  comma-separated fields. `hx.scale:481.74`, `OK`, `ERR`, `tare=X` all silently
+  dropped. Fix: route any line not starting with a digit to the log strip instead.
+
 ## TODO
 
 - [ ] `lib/modules/mod_hx711.h/.cpp` — shared HX711 driver

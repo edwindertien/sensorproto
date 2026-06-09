@@ -69,8 +69,10 @@ public:
 
 private:
     Config   _cfg;
-    int32_t  _last  = 0;
-    bool     _ready = false;
+    int32_t  _last     = 0;
+    bool     _ready   = false;
+    int64_t  _avgAcc = 0;   // accumulator for non-blocking averaging
+    uint8_t  _avgN   = 0;   // samples collected so far
 
     // param name buffers (built from prefix in constructor)
     char _keyScale[16];

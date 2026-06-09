@@ -37,11 +37,9 @@ bool Hx711Module::isReady() const {
 }
 
 int32_t Hx711Module::readOnce() {
-    // Wait up to 100ms for data ready
-    uint32_t t0 = millis();
-    while (digitalRead(_cfg.pinDout) == HIGH) {
-        if ((uint32_t)(millis() - t0) > 100) return _last; // timeout, return stale
-    }
+    // Non-blocking: if not ready return stale value immediately.
+    // This keeps UniProto's command loop responsive.
+    if (digitalRead(_cfg.pinDout) == HIGH) return _last;
 
     uint32_t raw = 0;
     for (int i = 0; i < 24; i++) {
@@ -85,8 +83,21 @@ float Hx711Module::toUnits(int32_t raw) const {
 }
 
 void Hx711Module::poll() {
-    if (isReady()) readRaw();
+    // Call from loop() for non-blocking averaged reading.
+    // Accumulates samples whenever HX711 is ready.
+    if (digitalRead(_cfg.pinDout) == LOW) {
+        int32_t r = readOnce();
+        _avgAcc  += r;
+        _avgN++;
+        if (_avgN >= _cfg.avgCount) {
+            _last     = (int32_t)(_avgAcc / _avgN);
+            _avgAcc   = 0;
+            _avgN = 0;
+        }
+    }
 }
+
+
 
 // ── stream ────────────────────────────────────────────────────────────────────
 
@@ -95,7 +106,8 @@ void Hx711Module::emitFn(UniProto& p, uint8_t sid, UniFrameWriter& w, void* ctx)
 }
 
 void Hx711Module::emit(UniProto& p, uint8_t sid, UniFrameWriter& w) {
-    _last = readAvg(_cfg.avgCount);
+    // Non-blocking single read — averaging is done in poll() via loop()
+    _last = readOnce();
     const float units = toUnits(_last);
     w.begin(sid);
     w.i32(_last,  "raw");
@@ -147,9 +159,8 @@ bool Hx711Module::setParam(UniProto&, const char* key, const char* value, void* 
         return true;
     }
     if (!strcmp(key, m->_keyZero)) {
-        // Capture current reading as tare zero
+        // Use most recent reading as tare — avoids blocking readAvg() in cmd handler
         if (UniProto::parseInt(value)) {
-            m->_last = m->readAvg(8);  // average 8 readings for stable zero
             m->_cfg.tare = m->_last;
         }
         return true;
