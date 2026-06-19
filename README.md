@@ -55,7 +55,7 @@ readers/
 | `biosensors` | Grove GSR + ear-clip HR | Uno | mod_adc | ⬜ | ⬜ |
 | `wind_speed` | optical gate wind sensor | Uno | mod_adc | ⬜ | ⬜ |
 | `piezo_midi` | 4× piezo + MIDIUSB | **Leonardo** | mod_adc, MIDIUSB | ⬜ | ⬜ |
-| `cap_sense` | variable capacitor, 10 MΩ RC | Uno | inline | ⬜ | ⬜ |
+| `cap_sense` | variable capacitor, 10 MΩ RC | **Duemilanove 168** | inline | ✅ | ✅ | `plot_cap_sense.py`
 | `kitchen_scales` | load cell + HX711 | Uno | inline HX711 | ⬜ | ⬜ |
 | `us_distance` | HC-SR04 ultrasonic | Uno | inline | ⬜ | ⬜ |
 | `accelerometer` | MMA7260 3-axis analog | Uno | mod_adc | ⬜ | ⬜ |

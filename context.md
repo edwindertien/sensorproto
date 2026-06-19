@@ -198,6 +198,49 @@ a reader script will be used, as they set it themselves on connect.
   comma-separated fields. `hx.scale:481.74`, `OK`, `ERR`, `tare=X` all silently
   dropped. Fix: route any line not starting with a digit to the log strip instead.
 
+### matplotlib Button garbage collection (all visualisers)
+**Symptom:** Only the last button in a loop responds to clicks; earlier buttons
+show no hover colour change and fire no events.  
+**Cause:** Button objects created in a loop with `b = Button(...)` — the variable
+`b` gets overwritten each iteration. Python GC destroys the previous Button
+objects and their event connections.  
+**Fix:** Keep all button objects in a list: `_btns = []` ... `_btns.append(b)`.  
+**Affects:** Any visualiser that creates buttons in a loop. Check all `plot_*.py`
+files for this pattern.
+
+### cap_sense — variable capacitor (200pF radio type)
+
+- Board: Arduino Duemilanove ATmega168 — board ID `diecimilaatmega168`.
+  Only 14KB flash / 1KB RAM; requires reduced UniProto limits
+  (`MAX_STREAMS=4, MAX_ACTIONS=2, MAX_PARAMS=8`).
+- SENSE=A0, SEND=A3 (through 10MΩ resistor). τ = RC = 2ms at max capacitance.
+- Mode 0 (analog voltage after fixed charge delay) works well. 200µs delay
+  gives inverted reading (more overlap = lower voltage) because large C charges
+  slowly. 5ms delay gives natural direction (more overlap = higher voltage).
+- Variable capacitor reading was non-linear with sudden drop to zero at one
+  rotation angle — caused by a **bent rotor plate shorting to stator**.
+  Diagnosed by continuity test across terminals while rotating shaft.
+  Fixed by carefully bending plate back. After fix: smooth linear reading
+  across full rotation range (~400 counts plates-out to ~90 counts plates-in
+  at 200µs delay).
+- The small "bump" at full mesh was the trimmer capacitor in parallel (common
+  on old radio tuning caps for alignment).
+
+### Negative-value gating bug (load_cell, kitchen_scales)
+**Symptom:** Data silently stops reaching chart/digit display whenever the raw
+value goes negative (e.g. after taring above the current reading), while still
+printing in terminal/log.  
+**Cause:** Receive-loop filter checked `line[0].lstrip("-").isdigit()` to decide
+if a line was data vs a text response. For a line like `-4728,-92.000`,
+`lstrip("-")` strips the leading sign but the comma later in the string still
+fails `.isdigit()` for the *whole remaining string*, so genuine data lines with
+negative values were misclassified as text and logged instead of parsed.  
+**Fix:** Don't pre-filter by character. Instead: try to split on comma and parse
+as numbers; if that fails (wrong field count or ValueError), THEN treat as a
+text response and log it. This correctly handles negative numbers in any field.  
+**Pattern for future readers:** parse-first, classify-by-failure — not
+classify-first, parse-if-classified-as-data.
+
 ## TODO
 
 - [ ] `lib/modules/mod_hx711.h/.cpp` — shared HX711 driver

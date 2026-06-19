@@ -145,7 +145,6 @@ def main():
     log_text  = ax_log.text(0, 1, "", fontsize=6.5, va="top", family="monospace")
 
     def log(msg):
-        print(msg)
         log_lines.pop(0)
         log_lines.append(msg[:38])
         log_text.set_text("\n".join(log_lines))
@@ -230,12 +229,9 @@ def main():
                 line = line_b.decode("utf-8", errors="ignore").strip()
                 if not line:
                     continue
-                # Log any non-data response (OK, ERR, param replies, tare=...)
-                if not line[0].lstrip("-").isdigit():
-                    log(f"  {line}")
-                    continue
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) != 2:
+                    log(f"  {line}")
                     continue
                 try:
                     last_raw[0] = int(parts[0])
@@ -244,7 +240,8 @@ def main():
                     val_buf.append(last_val[0])
                     new_data = True
                 except ValueError:
-                    pass
+                    log(f"  {line}")
+                    continue
 
             now = time.time()
             if new_data and (now - last_draw) >= 0.04:
