@@ -1,251 +1,191 @@
-# UniProto — Project Context & Debug Log
+# UniProto — Context & Decision Log
 
-Running record of environment issues, design decisions, and hardware findings
-encountered during bring-up. Newest entries at the top of each section.
-
----
-
-## Environment
-
-| item | value |
-|------|-------|
-| Host OS | macOS |
-| PlatformIO Python | 3.11 (embedded at `~/.platformio/penv/`) |
-| System Python | 3.14 (brew) |
-| Arduino framework | atmelavr (PlatformIO) |
-| Primary board | Arduino Uno |
-| Secondary board | Arduino Leonardo (piezo_midi) |
+Running log of bugs found, decisions made, and lessons learned across
+development sessions.
 
 ---
 
-## PlatformIO / build issues
+## Architecture Decisions
 
-### `build_src_filter` does not work in `[env:*]` sections (resolved)
-**Symptom:** `undefined reference to setup / loop` at link time, or
-`Nothing to build. Please put your source code files to the 'src' folder`.  
-**Cause:** `build_src_filter` patterns are always relative to `src_dir`
-(default `src/`). Setting it per-env does not change `src_dir`, so patterns
-like `+<src_optical_mouse/>` resolve to `src/src_optical_mouse/` — which
-does not exist.  
-`src_dir` itself is only honoured in `[platformio]`, not in `[env:*]`.  
-**Fix:** Add `[platformio] src_dir = .` (project root) and use
-`build_src_filter = -<*> +<src_optical_mouse/>` per env.
-Patterns now resolve from the project root.
+### PlatformIO multi-environment structure
+`src_dir = .` in `[platformio]` (not in `[env:*]`) with per-env
+`build_src_filter = -<*> +<src_name/>` resolves "undefined reference to
+setup/loop" and "Nothing to build" errors when sharing a repo across setups.
 
----
+### Binary framing
+`w.begin(sid, payloadLen)` requires an explicit payload length. Omitting it
+(using default `payloadLen=0`) silently no-ops all subsequent field writes.
+Payload length = sum of all field byte sizes: u16=2, i32=4, f32=4, u8[N]=N.
 
-## Python / matplotlib issues
-
-### TkAgg backend unavailable in PlatformIO's embedded Python (resolved)
-**Symptom:**
-```
-ModuleNotFoundError: No module named '_tkinter'
-```
-**Cause:** PlatformIO ships its own Python 3.11 at `~/.platformio/penv/`.
-`brew install python-tk` installs tkinter for the system Python (3.14),
-not for PlatformIO's Python 3.11.  
-**Fix:** Use `matplotlib.use("MacOSX")` in all reader scripts.
-The `MacOSX` backend is native to macOS matplotlib wheels and requires
-no additional packages.  
-**Alternative:** Run readers with system Python (`python3 plot_*.py ...`)
-after `pip3 install pyserial matplotlib numpy` there.
-
-### `plot_adns_picture.py` exits immediately with no output (resolved)
-**Symptom:** Script prints the three setup commands then terminates with
-`zsh: terminated`.  
-**Cause 1:** `plt.ion()` with a non-interactive or unavailable backend
-raises an unhandled exception that kills the process before the `while True`
-loop starts.  
-**Cause 2:** `--show` flag was absent — the original script skipped all
-matplotlib setup when `--show` was not passed, so no window appeared even
-when data was flowing.  
-**Fix:** Rewrite `plot_adns_picture.py` to always create the window, add
-`matplotlib.use("MacOSX")` before the import, and use
-`plt.fignum_exists(fig.number)` as the loop condition so the script exits
-cleanly when the window is closed.
+### EU grading formula (rubric tools)
+`grade = 1 + 9 × (earned / max)`
 
 ---
 
-### Serial buffer lag in visualiser scripts (resolved)
-**Symptom:** Cursor and strip chart continue moving for several seconds after
-motion has stopped.  
-**Cause:** Using `readline()` in the main loop reads one line per iteration.
-If the draw step takes longer than the sample interval the OS serial buffer
-fills up and the backlog grows unboundedly — the visualiser is always showing
-the past, not the present.  
-**Fix:** Use `timeout=0.0` (non-blocking) and `ser.in_waiting` to drain
-all available bytes in one `ser.read()` call each iteration. Parse every
-complete line in the resulting buffer so all queued samples update the internal
-state, but only draw once per frame (every ~40 ms). Also call
-`ser.reset_input_buffer()` after the setup commands to discard anything
-queued during the connect/config delay.  
-**Pattern to use in all future readers:**
+## Python Reader Patterns
+
+### Non-blocking serial
 ```python
-ser = serial.Serial(port, baud, timeout=0.0)   # non-blocking
-# in the loop:
+ser = serial.Serial(port, baud, timeout=0.0)
+time.sleep(2.0); ser.reset_input_buffer()
+# in loop:
 waiting = ser.in_waiting
-if waiting:
-    rxbuf += ser.read(waiting)
-while b"\n" in rxbuf:
-    line, rxbuf = rxbuf.split(b"\n", 1)
-    # parse line, update state
-# draw only at fixed interval, not per line
+if waiting: rxbuf += ser.read(waiting)
 ```
 
-### `UNIPROTO_MAX_PARAMS` redefined warnings (resolved)
-**Symptom:** Dozens of `warning: "UNIPROTO_MAX_PARAMS" redefined` during compilation.  
-**Cause:** `build_flags` in `[env]` included `-DUNIPROTO_MAX_PARAMS=32`, and
-envs that needed a higher value appended `${env.build_flags} -DUNIPROTO_MAX_PARAMS=40`,
-defining it twice. PlatformIO passes all flags to every translation unit so the
-warning fires once per .cpp file.  
-**Fix:** Move shared flags to a `[common]` section with a `build_flags_base` key.
-`[env]` inherits via `build_flags = ${common.build_flags_base}`. Envs that need
-different values define `build_flags` explicitly without inheriting, so no
-double-definition occurs.
+### Parse-first receive
+Try comma-split and int/float parse; if fails → log as text. Never
+pre-filter on first character — negative CSV values start with `-`
+which fails `.isdigit()`.
 
-### `i2cScan()` defined but not used warning (known, low priority)
-`static void i2cScan()` is defined in `mod_bldc.h` as a bring-up helper.
-Being `static` in a header means it gets compiled into every TU that includes
-the header, even when not called. Fix: move to `mod_bldc.cpp` behind an
-`#ifdef BLDC_ENABLE_I2C_SCAN` guard. Deferred until bldc_gimbal is verified.
+```python
+parts = [p.strip() for p in line.split(",")]
+if len(parts) != N:
+    log(f"  {line}")   # text response
+    continue
+try:
+    val = float(parts[0])
+    ...
+except ValueError:
+    log(f"  {line}")
+    continue
+```
 
-## Hardware findings
+### Matplotlib Button GC
+Buttons created in loops must be stored in a list:
+```python
+_btns = []
+for ...:
+    b = Button(...)
+    b.on_clicked(...)
+    _btns.append(b)   # ← essential, prevents GC killing event handlers
+```
 
-### optical_mouse — ADNS2610 motion (plot_adns_motion.py)
-- `plot_adns_motion.py` — XY cursor trail (left) + dx/dy strip chart (right).
-  Non-blocking serial drain pattern required to avoid lag (see serial buffer
-  lag issue above).
-- Strip chart x-axis uses `range(-N, 0)` (samples ago) rather than absolute
-  counter — feels like a scrolling window.
+### TextBox double-fire
+`on_submit` fires on both Enter keypress and focus-loss. Use a simple
+debounce or just accept the duplicate (Arduino ignores repeated same command).
 
-### optical_mouse (ADNS2610)
-
-- **Stuck pixel at (10, 4):** One pixel consistently reads maximum brightness (value 63/63)
-  regardless of scene content. Confirmed sensor artefact — remains bright with lens
-  fully covered. Not a communication error (all frame chunks arrive with correct
-  offsets and counts; stuck value is always 63, not random).
-  ADNS-2610 is a circa-2002 sensor with no on-chip bad-pixel correction.
-  Mitigation: mask and interpolate in the visualiser if needed.
-
-- **Binary framing verified:** 6 chunks × 54 pixels = 324 = 18×18 ✅.
-  Frame IDs increment correctly. `plot_adns_debug.py` confirms clean reception
-  before attempting visualisation.
-
-- **CSV mode drops pixel bytes by design:** `UniCsvWriter::bytes()` is a no-op —
-  frame data only transfers correctly in `!format:bin`. The 5 CSV header fields
-  (frame_id, w, h, offset, count) print correctly but pixel payload is silently
-  discarded. This is intentional in UniProto.
-
-### psd_distance (Sharp GP2Y0A710)
-
-- Default calibration constants (A=137.5, B=1.125) are for the GP2Y0A710K0F
-  variant. If readings are consistently offset, adjust `!psd.cal_a` and
-  `!psd.cal_b` at runtime — no reflash needed.
-- Default range clamped to 100–550 cm. Can be tuned at runtime:
-  `!psd.cm_min:20.0` / `!psd.cm_max:550.0`. Accuracy degrades below ~100 cm
-  due to the steep inverse calibration curve.
+### Matplotlib redraw at fixed interval
+```python
+last_draw = time.time()
+if new_data and (now - last_draw) >= 0.04:
+    last_draw = now; new_data = False
+    # update plots
+    fig.canvas.draw_idle(); fig.canvas.flush_events()
+else:
+    plt.pause(0.005)
+```
 
 ---
 
-## Design decisions
+## Sensor-Specific Notes
 
-### Project structure: `src_dir = .` + per-env `build_src_filter`
-Each setup lives in `src_<name>/main.cpp` at the project root.
-`lib/` is shared across all envs via PlatformIO's LDF (no explicit config needed).
-Chosen over separate repos, submodules, or a single `src/` with `#ifdef` guards.
+### HX711 (load_cell, kitchen_scales)
 
-### Inline HX711 driver (load_cell, kitchen_scales, pneumatic)
-Three setups share an identical minimal inline HX711 read loop rather than a
-proper `mod_hx711` module. To be refactored into `lib/modules/mod_hx711.h/.cpp`
-once all three setups are hardware-verified.
+- **Wrong param prefix bug:** `defaultUno2()` sets `prefix="hx2"`. Override
+  with `c.prefix = "hx"` in `makeCfg()` if you only want `hx.*` params.
+- **Blocking reads stall serial:** `readAvg(4)` at 100ms per sample = 400ms
+  blocking per emit. Fix: non-blocking `readOnce()` in emit (returns stale
+  if DOUT not ready); averaging via accumulator in `poll()` called from `loop()`.
+- **TextBox double-fire:** see above.
+- **Non-data responses swallowed:** receive loop only parsed 2-field CSV lines.
+  Fix: parse-first pattern above.
+- **Negative value gating:** `line[0].lstrip("-").isdigit()` incorrectly
+  rejects negative CSV values. Fix: parse-first, classify by parse failure.
 
-### matplotlib backend strategy
-All reader scripts use `matplotlib.use("MacOSX")` placed before the matplotlib
-import. This must come before any `import matplotlib.pyplot` line. If porting
-to Linux replace with `"TkAgg"` or `"Qt5Agg"`.
+### AS5600 + BLDC Gimbal
 
-### Binary vs CSV for pixel/block data
-`UniCsvWriter::bytes()` is intentionally a no-op. Any setup streaming bulk
-data (ADNS frame, ADC block) must use `!format:bin`. The reader scripts handle
-the switch automatically — do not manually set binary mode in the monitor when
-a reader script will be used, as they set it themselves on connect.
+- **Magnet range:** 4mm diametric disc magnet gives 12-bit range (0–4095)
+  not 14-bit (0–16383). Scale: `raw / 4095.0 * 2π`.
+- **Startup zero:** initialise `_prev` to first AS5600 reading so `_angle`
+  starts at 0 naturally. Do NOT subtract a `_start_offset` — this creates
+  spurious wraps when the raw reading crosses zero, corrupting `_angle` by
+  ±2π and causing the spring to push away instead of pull back.
+- **FOC on Uno:** SimpleFOC exceeds 32KB flash (33.9KB). Custom minimal
+  FOC implemented instead.
+- **PWM symmetry:** Timer1 (pins 9,10) must use same range as Timer2 (pin 11).
+  Set `ICR1=255` so all three phases use 0–255 — otherwise phase C has half
+  the resolution and the three-phase symmetry breaks, creating a preferred
+  rotation direction.
+- **Electrical angle negation:** with `diff = -diff` (CW=positive mechanical),
+  electrical angle must be `-_angle * poles` to produce symmetric torque.
+  Spring `vq = -k * err` is then correct (negative vq when error is positive).
+- **Pole pairs (BDUA 2204):** 7 pole pairs confirmed by open-loop stable
+  point count and 1/7-revolution-per-electrical-revolution sweep test.
+- **Sweep direction:** with negated electrical angle, `_th_open -= sweep_hz * dt`
+  gives CW = positive `sweep_hz`.
+- **Phase offset `foc.ph`:** adjustable to compensate for minor CW/CCW
+  speed asymmetry in sweep mode.
+
+### Cap sense (Duemilanove 168)
+
+- Board ID: `diecimilaatmega168` (not `diecimila`)
+- Only 14KB flash / 1KB RAM → reduced UniProto limits in build flags
+- `_delay_us` is a reserved function name in AVR libc. Rename to `_chargeUs`.
+- 200pF + 10MΩ: τ = 2ms. Mode 0 at 200µs charge delay works well.
+- Non-linear range or sudden drop to zero: check for bent rotor plate
+  (shorting stator). Confirmed fix: bend plate back with toothpick.
+
+### Synchro transformer
+
+- Timer2 used for 5kHz ISR (not PWM output). Timer0/Timer1 set for
+  fast PWM on phase output pins.
+- Timer0 prescaler change (`TCCR0B = 1`) breaks `millis()` — UniProto's
+  rate limiter is affected but communication still works.
+- Binary framing required for frame data. Startup sequence must silence
+  stream first (`!stream:0`) before switching format.
+- `w.begin(sid)` with no payload length silently drops all data in binary
+  mode. Must pass explicit `payloadLen = 3*2 + count`.
+- Angle cross-correlation: torn-read race between ISR writing `_capture[]`
+  and main loop reading it. Angle values erratic. TODO: double-buffer.
+
+### MMA7260 accelerometer
+
+- SLEEP, GS1, GS2 must be driven as digital outputs before sensor works.
+- g-select: GS1=0, GS2=0 → ±1.5g, 800mV/g, Vzero=1.65V.
+- `atan2` for pitch/roll (not `asin`): `asin` compresses large angles
+  by ~6×. `atan2(gx, sqrt(gy²+gz²))` gives correct ±90° range.
+- Matplotlib button GC bug affected avg/rate buttons in loop — fixed with
+  `_rate_btns = []` / `_avg_btns = []` lists.
 
 ---
 
-### haptic — dual Maxon motor + L293
+## BLDC Gimbal — Debugging Chronicle
 
-- **500 ticks/rev** confirmed on output shaft (measured with spin tool, 5s at PWM=80).
-  Likely 100 PPR encoder × 5:1 gear, exact split unknown but irrelevant for control.
-- **~220 RPM output** at PWM=80 (~31% duty, 5V supply).
-- **Kp=1.5, pwm_lim=180** gives textbook step response: ~5% overshoot, single
-  correction pulse, locks on target. No Ki or Kd needed for basic positioning.
-- Bidirectional haptic link (`!motor.link:3`) works. `!motor.link_scale:0.5`
-  gives softer coupling feel.
-- `plot_dual_motor.py` has integrated command panel (send box + preset buttons)
-  so no second serial terminal is needed during tuning.
+Long debug trail worth documenting to avoid repeating.
 
-### HX711 bring-up issues (load_cell)
+1. **M5Stack DRV11873** — wrong driver. Sensorless BEMF trapezoidal,
+   minimum speed required. Unsuitable for gimbal.
+2. **SimpleFOC** — too large for Uno (33.9KB > 32KB). Custom FOC written.
+3. **38400 baud** — left over from original Processing sketch. Changed to
+   115200 to match rest of project. Was causing "no response" symptom.
+4. **Binary framing** — `w.begin(sid)` with no payload length silently
+   dropped all data. Fixed by passing explicit `payloadLen`.
+5. **PWM asymmetry** — Timer1 using `ICR1=511` (0–511 range) while Timer2
+   used 0–255. Caused preferred rotation direction. Fixed: `ICR1=255`.
+6. **`_start_offset` bug** — subtracting startup position from raw reading
+   caused a spurious `±2π` jump in `_angle` whenever the raw sensor crossed
+   zero, depending on startup position. Spring then applied wrong-direction
+   force at that angular position. Fixed: removed `_start_offset` entirely;
+   initialise `_prev` to first reading instead.
+7. **Electrical angle sign** — with CW=positive `_angle` (via `diff = -diff`),
+   must use `-_angle * poles` for electrical angle. Spring `vq = -k * err`
+   is then correct. Sweep uses `_th_open -= sweep_hz * dt`.
+8. **Pole pairs** — confirmed 7 by two methods: open-loop stable point count
+   (4 originally confused us, but was actually TWO separate issues at once),
+   and 1/7-revolution per electrical sweep.
 
-- **Wrong param prefix**: `defaultUno2()` sets `prefix="hx2"`, so params registered
-  as `hx2.scale`, `hx2.tare` etc. Override with `c.prefix = "hx"` in `makeCfg()`.
-- **Blocking reads stall serial**: `readAvg(4)` with 100ms timeout per sample = 400ms
-  blocking per emit at 10Hz. Incoming commands dropped during that window.
-  Fix: non-blocking `readOnce()` returns stale if DOUT not ready; averaging done
-  in `poll()` via `loop()`.
-- **TextBox double-fire**: matplotlib TextBox `on_submit` fires on both Enter keypress
-  and focus-loss. Added `_pending` flag to suppress duplicate sends.
-- **Non-data responses swallowed**: receive loop only parsed lines with exactly 2
-  comma-separated fields. `hx.scale:481.74`, `OK`, `ERR`, `tare=X` all silently
-  dropped. Fix: route any line not starting with a digit to the log strip instead.
-
-### matplotlib Button garbage collection (all visualisers)
-**Symptom:** Only the last button in a loop responds to clicks; earlier buttons
-show no hover colour change and fire no events.  
-**Cause:** Button objects created in a loop with `b = Button(...)` — the variable
-`b` gets overwritten each iteration. Python GC destroys the previous Button
-objects and their event connections.  
-**Fix:** Keep all button objects in a list: `_btns = []` ... `_btns.append(b)`.  
-**Affects:** Any visualiser that creates buttons in a loop. Check all `plot_*.py`
-files for this pattern.
-
-### cap_sense — variable capacitor (200pF radio type)
-
-- Board: Arduino Duemilanove ATmega168 — board ID `diecimilaatmega168`.
-  Only 14KB flash / 1KB RAM; requires reduced UniProto limits
-  (`MAX_STREAMS=4, MAX_ACTIONS=2, MAX_PARAMS=8`).
-- SENSE=A0, SEND=A3 (through 10MΩ resistor). τ = RC = 2ms at max capacitance.
-- Mode 0 (analog voltage after fixed charge delay) works well. 200µs delay
-  gives inverted reading (more overlap = lower voltage) because large C charges
-  slowly. 5ms delay gives natural direction (more overlap = higher voltage).
-- Variable capacitor reading was non-linear with sudden drop to zero at one
-  rotation angle — caused by a **bent rotor plate shorting to stator**.
-  Diagnosed by continuity test across terminals while rotating shaft.
-  Fixed by carefully bending plate back. After fix: smooth linear reading
-  across full rotation range (~400 counts plates-out to ~90 counts plates-in
-  at 200µs delay).
-- The small "bump" at full mesh was the trimmer capacitor in parallel (common
-  on old radio tuning caps for alignment).
-
-### Negative-value gating bug (load_cell, kitchen_scales)
-**Symptom:** Data silently stops reaching chart/digit display whenever the raw
-value goes negative (e.g. after taring above the current reading), while still
-printing in terminal/log.  
-**Cause:** Receive-loop filter checked `line[0].lstrip("-").isdigit()` to decide
-if a line was data vs a text response. For a line like `-4728,-92.000`,
-`lstrip("-")` strips the leading sign but the comma later in the string still
-fails `.isdigit()` for the *whole remaining string*, so genuine data lines with
-negative values were misclassified as text and logged instead of parsed.  
-**Fix:** Don't pre-filter by character. Instead: try to split on comma and parse
-as numbers; if that fails (wrong field count or ValueError), THEN treat as a
-text response and log it. This correctly handles negative numbers in any field.  
-**Pattern for future readers:** parse-first, classify-by-failure — not
-classify-first, parse-if-classified-as-data.
+---
 
 ## TODO
 
-- [ ] `lib/modules/mod_hx711.h/.cpp` — shared HX711 driver
-- [ ] `lib/modules/mod_hc_sr04.h` — HC-SR04 as proper module  
-- [ ] `lib/modules/mod_wiimote.h` — Wiimote IR camera module
-- [ ] Dead-pixel correction option in `plot_adns_picture.py` (`--deadpix x,y`)
-- [ ] `readers/unistream.py` base class — extract common serial boilerplate
-      (after all setups verified)
+- [ ] **bldc_gimbal:** Verify spring symmetry after latest firmware fixes
+- [ ] **bldc_gimbal:** Tune spring/damper, step response testing
+- [ ] **bldc_gimbal:** Implement detent mode verification
+- [ ] **synchro:** Fix angle cross-correlation torn-read race (double-buffer)
+- [ ] **wind_speed:** Add pulse counting for calibrated flow measurement
+- [ ] **kitchen_scales:** Verify calibration after parser fixes
+- [ ] **readers/unistream.py:** Extract common serial boilerplate
+- [ ] Apply parse-first pattern to `plot_cap_sense.py` and `plot_wind_raw.py`
+- [ ] **NAO robot:** USB recovery flash to NAOqi 2.1 (Project Glasswing pending)
+- [ ] **DRV8313 SimpleFOC on Mega:** mod_simplefoc wrapper when hardware arrives

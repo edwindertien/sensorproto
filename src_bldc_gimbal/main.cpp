@@ -58,10 +58,12 @@ static void setupPWM() {
 static void motorOff() { OCR1A = 127; OCR1B = 127; OCR2A = 127; }
 
 // ── AS5600 ───────────────────────────────────────────────────────────────────
-static uint16_t _raw_count    = 0;
-static float    _start_offset = 0.0f;  // physical angle at power-on
+static uint16_t _raw_count = 0;
 
-static float readAS5600raw() {
+// Returns raw sensor angle 0..2π. No offset subtraction — keep it simple.
+// Zero reference is handled by initialising _prev = first reading,
+// so _angle starts at 0 naturally. @foc.zero resets _angle and _set.
+static float readAS5600() {
     Wire.beginTransmission(AS5600_ADDR);
     Wire.write(AS5600_REG);
     if (Wire.endTransmission(false) != 0) return -1.0f;
@@ -69,18 +71,7 @@ static float readAS5600raw() {
     if (Wire.available() < 2) return -1.0f;
     uint16_t raw = ((uint16_t)(Wire.read() & 0x0F) << 8) | Wire.read();
     _raw_count = raw;
-    return raw / 4095.0f * 2.0f * (float)PI;   // 0..2π
-}
-
-// Returns angle relative to startup position, 0..2π
-static float readAS5600() {
-    float r = readAS5600raw();
-    if (r < 0.0f) return -1.0f;
-    // Subtract startup offset and keep in 0..2π
-    float a = r - _start_offset;
-    if (a < 0.0f)          a += 2.0f * (float)PI;
-    if (a > 2.0f*(float)PI) a -= 2.0f * (float)PI;
-    return a;
+    return raw / 4095.0f * 2.0f * (float)PI;   // 0..2π, absolute
 }
 
 // ── params ───────────────────────────────────────────────────────────────────
@@ -142,6 +133,15 @@ static float computeVq() {
             return -_k * err;
 
         case 2: {
+            // fmodf preserves the sign of the dividend, so detents only
+            // work correctly on the positive side of zero (err > 0).
+            // On the negative side the sawtooth phase is offset and does
+            // not oscillate symmetrically. This is by design — detents
+            // start from zero and extend in one direction only.
+            // To get symmetric detents in both directions, replace fmodf
+            // with a positive modulo:
+            //   float e = err - _detent * floorf(err / _detent);
+            //   float phase = e - half;
             float half  = _detent * 0.5f;
             float phase = fmodf(err + half, _detent) - half;
             return -_detent_k * phase;
@@ -234,14 +234,6 @@ void setup() {
     Wire.beginTransmission(AS5600_ADDR);
     bool ok = (Wire.endTransmission() == 0);
 
-    // Capture startup position as zero reference
-    // Read a few times to let AS5600 settle
-    for (uint8_t i = 0; i < 5; i++) {
-        float r = readAS5600raw();
-        if (r >= 0.0f) _start_offset = r;
-        delay(2);
-    }
-
     Serial.begin(115200);
     proto.begin();
     proto.setRateHz(50);
@@ -264,10 +256,13 @@ void setup() {
     proto.registerParam({"foc.ph",       UniProto::ParamType::FLOAT, getParam,setParam,nullptr});
     proto.registerAction({"foc.zero", doZero, nullptr});
 
-    // Initialise unwrap reference
+    // Initialise _prev from actual sensor reading so first diff ≈ 0
+    // and _angle starts at exactly 0 regardless of physical position.
+    // Use @foc.zero to re-zero at any time during operation.
     float r = readAS5600();
     _prev    = (r >= 0.0f) ? r : 0.0f;
     _angle   = 0.0f;
+    _set     = 0.0f;
     _last_us = micros();
 
     if (!ok) Serial.println(F("WARN: AS5600 not found"));
@@ -306,7 +301,9 @@ void loop() {
             setPhases(vq, _th_open);
         } else if (_mode == 5) {
             if (dt > 0.0f) {
-                _th_open += 2.0f * (float)PI * _sweep_hz * dt;
+                // Positive sweep_hz = CW = positive _angle direction.
+                // Since electrical angle = -_angle*poles, we subtract here.
+                _th_open -= 2.0f * (float)PI * _sweep_hz * dt;
             }
             setPhases(vq, _th_open);
         } else {
