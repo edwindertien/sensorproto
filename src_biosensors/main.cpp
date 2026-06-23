@@ -1,46 +1,44 @@
 #include <Arduino.h>
 #include "UniProto.h"
-#include "mod_adc.h"
 
 // ── Device ────────────────────────────────────────────────────────────────────
-// Grove biosensors: GSR (galvanic skin response) on A0,
-//                   ear-clip heart rate on A1.
+// Grove GSR sensor       → A0 (analog, yellow wire on Grove shield)
+// Grove ear-clip heart   → A4 (analog read of digital pulse output)
 //
-// GSR: higher ADC value = lower skin resistance (higher conductance).
-//      Good baseline rate: 10 Hz, no averaging.
-// Heart rate: optical pulse. Sample at 100 Hz, filter in Python.
+// Both sensors sampled at 50Hz — fast enough to see the pulse waveform
+// clearly (typical HR 60-120 BPM = 1-2 Hz, Nyquist needs >4Hz).
 //
-// Useful commands:
-//   !stream:1                  start
-//   !rate:100                  100 Hz for heart rate
-//   !adc.mode:1                volts (easier to compare)
-//   !adc.window:1              no averaging — keep pulse shape
+// Stream 1: gsr(u16), hr_raw(u16)
+//
+// GSR: raw ADC 0-1023. Higher = more resistance = less arousal.
+//   Skin conductance = inverse. Slow signal, changes over seconds.
+//
+// Heart rate: raw ADC from A4. The ear-clip outputs a digital signal
+//   but we read it as analog — gives 0 or ~1023 (5V digital).
+//   Peak detection done in Python from the waveform.
+//   Note: Grove I2C socket connects to A4/A5 — no I2C devices
+//   should be present on this sketch.
 // ─────────────────────────────────────────────────────────────────────────────
 
-UniProto proto(Serial, "Biosensors");
+#define PIN_GSR  A0
+#define PIN_HR   A5   // Grove I2C socket SCL pin, used as plain analog in
 
-static AdcModule::Config makeCfg() {
-    auto c = AdcModule::defaultUno();
-    c.channelCount = 2;
-    c.channels[0]  = A0; // GSR
-    c.channels[1]  = A1; // heart rate
-    c.vref         = 5.0f;
-    c.avgWindow    = 1;  // no averaging — keep waveform shape
-    c.valuesCount  = 1;
-    c.values[0].id     = 1;
-    c.values[0].name   = "bio";
-    c.values[0].schema = "u16,u16";
-    c.values[0].units  = "gsr,hr";
-    c.values[0].selCount = 0;
-    return c;
+UniProto proto(Serial, "BioSensors");
+
+static void emitBio(UniProto&, uint8_t sid, UniFrameWriter& w, void*) {
+    uint16_t gsr = (uint16_t)analogRead(PIN_GSR);
+    uint16_t hr  = (uint16_t)analogRead(PIN_HR);
+    w.begin(sid);
+    w.u16(gsr, "gsr");
+    w.u16(hr,  "hr");
+    w.end();
 }
-
-AdcModule adc(makeCfg());
 
 void setup() {
     Serial.begin(115200);
     proto.begin();
-    adc.registerWith(proto);
+    proto.setRateHz(50);
+    proto.registerStream({1, "bio", "u16,u16", "raw,raw", emitBio, nullptr});
 }
 
 void loop() {
