@@ -1,86 +1,129 @@
 #include <Arduino.h>
 #include "UniProto.h"
-#include "mod_adc.h"
 
-// ── Device ────────────────────────────────────────────────────────────────────
-// QTR-8 optical reflection sensor array → absolute gray-code position.
-// Analog outputs on A0..A5 (6 sensors; remaining 2 on digital 6,7 as analog
-// via analogRead if using a MEGA or mapping on an Uno — see note below).
+// ── Pololu QTR-8RC — Duemilanove ATmega328p ───────────────────────────────────
+// Sensors on digital pins 4–11 (parallel RC discharge timing).
 //
-// Gray code decoding: threshold each sensor (raw > 512 = 1, else 0),
-// then decode 6-bit gray code → binary position.
+// Streams (enable what you need):
+//   1 "raw"  : s0..s7 decay times in µs (8× u16)
+//              The primary stream — everything else can be derived from this.
+//   2 "bin"  : b0..b7 thresholded 0/1   (8× u16)
+//   3 "line" : line position 0.0–7.0     (f32)   weighted centroid
+//   4 "gray" : gray-code pattern          (u16)   for 256-position strip
 //
-// Stream 1: raw ADC values (6 channels)
-// Stream 2: decoded position (u16 0..63) + gray code byte (u16)
+// Python derives all of the above from stream 1 independently.
+// Streams 2-4 exist for use without Python (MIDI, other consumers).
 //
-// NOTE on QTR-8 + Uno: only 6 analog pins available. Use 6-bit code (64 positions).
-// For full 8 sensors on Uno you'd need two ADC channels via CD4051 mux (future).
+// Commands:
+//   !qtr.thr:1000       binary threshold µs (default 1000)
+//   !qtr.timeout:2500   max decay µs = full black (default 2500)
+//   @qtr.cal            auto-calibrate threshold from current scene
 // ─────────────────────────────────────────────────────────────────────────────
+
+#define N    8
+#define PINS_START 4   // pins 4..11
 
 UniProto proto(Serial, "QTR8");
 
-static uint16_t _threshold = 512; // per-sensor digital threshold
-static uint16_t _raw[6] = {};
+static uint16_t _thr     = 1000;
+static uint16_t _timeout = 2500;
+static uint16_t _raw[N]  = {0};
 
-// Gray-to-binary decode
-static uint8_t grayToBinary(uint8_t g) {
-    uint8_t b = 0;
-    for (; g; g >>= 1) b ^= g;
-    return b;
-}
-
-// ---- raw ADC stream ----
-static AdcModule::Config makeAdcCfg() {
-    auto c = AdcModule::defaultUno();
-    c.channelCount = 6;
-    for (uint8_t i = 0; i < 6; i++) c.channels[i] = A0 + i;
-    c.avgWindow   = 1; // no averaging — need fast digital thresholding
-    c.valuesCount = 1;
-    c.values[0].id     = 1;
-    c.values[0].name   = "qtr.raw";
-    c.values[0].schema = "u16,u16,u16,u16,u16,u16";
-    c.values[0].units  = "s0,s1,s2,s3,s4,s5";
-    c.values[0].selCount = 0;
-    return c;
-}
-AdcModule rawAdc(makeAdcCfg());
-
-// ---- decoded position stream ----
-static void emitPos(UniProto& p, uint8_t sid, UniFrameWriter& w, void* /*ctx*/) {
-    for (uint8_t i = 0; i < 6; i++) _raw[i] = (uint16_t)analogRead(A0 + i);
-    uint8_t gray = 0;
-    for (uint8_t i = 0; i < 6; i++) {
-        if (_raw[i] > _threshold) gray |= (1 << i);
+static void readAll() {
+    // Charge all capacitors simultaneously
+    for (uint8_t i = 0; i < N; i++) {
+        pinMode(PINS_START + i, OUTPUT);
+        digitalWrite(PINS_START + i, HIGH);
     }
-    uint8_t pos = grayToBinary(gray);
+    delayMicroseconds(10);
+    // Release and time decay in parallel
+    uint32_t t0 = micros();
+    for (uint8_t i = 0; i < N; i++) {
+        pinMode(PINS_START + i, INPUT);
+        _raw[i] = _timeout;
+    }
+    while (micros() - t0 < _timeout) {
+        uint32_t elapsed = micros() - t0;
+        bool all_done = true;
+        for (uint8_t i = 0; i < N; i++) {
+            if (_raw[i] == _timeout) {
+                if (digitalRead(PINS_START + i) == LOW)
+                    _raw[i] = (uint16_t)elapsed;
+                else
+                    all_done = false;
+            }
+        }
+        if (all_done) break;
+    }
+}
+
+// Stream 1: raw decay times
+static void emitRaw(UniProto&, uint8_t sid, UniFrameWriter& w, void*) {
     w.begin(sid);
-    w.u16(pos,  "pos");
-    w.u16(gray, "gray");
+    for (uint8_t i = 0; i < N; i++) w.u16(_raw[i], "us");
     w.end();
 }
 
-static bool getQtr(UniProto&, const char* key, char* out, size_t outLen, void*) {
-    if (!strcmp(key, "qtr.threshold")) { snprintf(out, outLen, "%u", (unsigned)_threshold); return true; }
+// Stream 2: binary threshold
+static void emitBin(UniProto&, uint8_t sid, UniFrameWriter& w, void*) {
+    w.begin(sid);
+    for (uint8_t i = 0; i < N; i++) w.u16(_raw[i] >= _thr ? 1 : 0, "b");
+    w.end();
+}
+
+// Stream 3: line position — pure weighted centroid, no threshold
+static void emitLine(UniProto&, uint8_t sid, UniFrameWriter& w, void*) {
+    uint32_t w_sum = 0, wi_sum = 0;
+    for (uint8_t i = 0; i < N; i++) {
+        w_sum  += _raw[i];
+        wi_sum += (uint32_t)i * _raw[i];
+    }
+    // Scale centroid (0..7) to 0..255
+    float pos = w_sum > 0 ? ((float)wi_sum / w_sum) / 7.0f * 255.0f : -1.0f;
+    w.begin(sid); w.f32(pos, "pos", 2); w.end();
+}
+
+// Stream 4: gray code pattern
+static void emitGray(UniProto&, uint8_t sid, UniFrameWriter& w, void*) {
+    uint16_t g = 0;
+    for (uint8_t i = 0; i < N; i++)
+        if (_raw[i] >= _thr) g |= (1 << (N - 1 - i));
+    w.begin(sid); w.u16(g, "gray"); w.end();
+}
+
+static bool getParam(UniProto&, const char* k, char* out, size_t len, void*) {
+    if (!strcmp(k,"qtr.thr"))     { snprintf(out,len,"%u",_thr);     return true; }
+    if (!strcmp(k,"qtr.timeout")) { snprintf(out,len,"%u",_timeout); return true; }
     return false;
 }
-static bool setQtr(UniProto&, const char* key, const char* value, void*) {
-    if (!strcmp(key, "qtr.threshold")) {
-        long v = UniProto::parseInt(value);
-        if (v < 0) v = 0; if (v > 1023) v = 1023;
-        _threshold = (uint16_t)v; return true;
-    }
+static bool setParam(UniProto&, const char* k, const char* v, void*) {
+    if (!strcmp(k,"qtr.thr"))     { _thr     = (uint16_t)UniProto::parseInt(v); return true; }
+    if (!strcmp(k,"qtr.timeout")) { _timeout = (uint16_t)UniProto::parseInt(v); return true; }
     return false;
+}
+
+static bool doCal(UniProto&, const char*, const char*, Stream& out, void*) {
+    uint32_t sum = 0;
+    for (uint8_t s = 0; s < 50; s++) { readAll(); for (uint8_t i=0;i<N;i++) sum+=_raw[i]; delay(10); }
+    _thr = (uint16_t)(sum / (50 * N));
+    out.print(F("qtr.cal thr=")); out.println(_thr);
+    return true;
 }
 
 void setup() {
     Serial.begin(115200);
     proto.begin();
-    proto.setRateHz(50);
-    rawAdc.registerWith(proto);
-    proto.registerStream({2, "qtr.pos", "u16,u16", "pos,gray", emitPos, nullptr});
-    proto.registerParam({"qtr.threshold", UniProto::ParamType::INT32, getQtr, setQtr, nullptr});
+    proto.setRateHz(20);
+    proto.registerStream({1,"raw", "u16,u16,u16,u16,u16,u16,u16,u16","s0,s1,s2,s3,s4,s5,s6,s7",emitRaw, nullptr});
+    proto.registerStream({2,"bin", "u16,u16,u16,u16,u16,u16,u16,u16","b0,b1,b2,b3,b4,b5,b6,b7",emitBin, nullptr});
+    proto.registerStream({3,"line","f32",                              "pos",                     emitLine,nullptr});
+    proto.registerStream({4,"gray","u16",                              "gray",                    emitGray,nullptr});
+    proto.registerParam({"qtr.thr",    UniProto::ParamType::INT32,getParam,setParam,nullptr});
+    proto.registerParam({"qtr.timeout",UniProto::ParamType::INT32,getParam,setParam,nullptr});
+    proto.registerAction({"qtr.cal", doCal, nullptr});
 }
 
 void loop() {
+    readAll();
     proto.tick();
 }
