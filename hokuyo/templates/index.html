@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>URG-04LX-UG01 &middot; live scan</title>
+<style>
+  :root{
+    --bg: #14171c;
+    --panel: #1b1f27;
+    --grid: #2a2f3a;
+    --grid-strong: #3a4152;
+    --text: #e7e9ee;
+    --text-dim: #7d8496;
+    --accent: #ff7a33;
+    --accent-dim: rgba(255, 122, 51, 0.28);
+    --accent-trail: rgba(255, 122, 51, 0.10);
+    --ok: #5ad07a;
+    --bad: #ff5c5c;
+  }
+  *{ box-sizing: border-box; }
+  html, body{
+    margin:0; height:100%; background:var(--bg); color:var(--text);
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  body{
+    display:flex; flex-direction:column; align-items:center; gap:14px;
+    padding: 20px 16px 32px;
+  }
+  header{
+    width:100%; max-width:760px; display:flex; justify-content:space-between; align-items:baseline;
+  }
+  header h1{
+    font-size:15px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; color:var(--text);
+    margin:0;
+  }
+  header .model{ color:var(--text-dim); font-size:12px; }
+  .status{
+    display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text-dim);
+  }
+  .dot{ width:7px; height:7px; border-radius:50%; background:var(--bad); box-shadow:0 0 6px var(--bad); }
+  .dot.live{ background:var(--ok); box-shadow:0 0 6px var(--ok); }
+
+  .controls{
+    width:100%; max-width:760px; display:flex; align-items:center; gap:18px; row-gap:8px; flex-wrap:wrap;
+    background:var(--panel); border:1px solid var(--grid); border-radius:8px;
+    padding:8px 12px; font-size:12px; color:var(--text-dim);
+  }
+  .controls label{ display:flex; align-items:center; gap:7px; cursor:pointer; user-select:none; }
+  .controls input[type="checkbox"]{ accent-color:var(--accent); width:14px; height:14px; }
+  .controls input[type="number"]{
+    width:56px; background:#10131a; border:1px solid var(--grid-strong); border-radius:5px;
+    color:var(--text); font-family:inherit; font-size:12px; padding:3px 5px;
+  }
+  .controls input[type="number"]:disabled{ opacity:0.4; }
+  .controls label:has(input:disabled){ opacity:0.4; }
+  .controls .filtered-count{ margin-left:auto; color:var(--text-dim); }
+  .controls .filtered-count b{ color:var(--accent); font-variant-numeric:tabular-nums; }
+
+  .stage{
+    position:relative; width:min(92vw, 720px); aspect-ratio:1/1;
+    background:radial-gradient(circle at 50% 55%, var(--panel), #10131a 85%);
+    border:1px solid var(--grid-strong); border-radius:12px; overflow:hidden;
+  }
+  canvas{ position:absolute; inset:0; width:100%; height:100%; }
+
+  .hud{
+    width:100%; max-width:760px;
+    display:grid; grid-template-columns: repeat(4, 1fr); gap:10px;
+  }
+  .card{
+    background:var(--panel); border:1px solid var(--grid); border-radius:8px;
+    padding:10px 12px;
+  }
+  .card .label{ font-size:10px; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-dim); }
+  .card .value{ font-size:20px; margin-top:4px; color:var(--accent); font-variant-numeric: tabular-nums; }
+  .card .value.small{ font-size:14px; color:var(--text); }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Hokuyo URG-04LX-UG01</h1>
+    <div class="model">240&deg; field of view &middot; 5.6 m range &middot; SCIP 2.0</div>
+  </div>
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">connecting&hellip;</span></div>
+</header>
+
+<div class="controls">
+  <label>
+    <input type="checkbox" id="filterToggle" checked />
+    Filter weak/close returns
+  </label>
+  <label>
+    min&nbsp;valid&nbsp;range
+    <input type="number" id="minReturn" value="60" min="0" max="1000" step="10" /> mm
+  </label>
+  <label>
+    <input type="checkbox" id="interpolateToggle" checked />
+    Interpolate gaps
+  </label>
+  <span class="filtered-count"><b id="interpolatedCount">0</b> interpolated &middot; <b id="filteredCount">0</b> hidden</span>
+</div>
+
+<div class="stage">
+  <canvas id="scan"></canvas>
+</div>
+
+<div class="hud">
+  <div class="card"><div class="label">Nearest point</div><div class="value" id="nearest">&mdash;</div></div>
+  <div class="card"><div class="label">Scan rate</div><div class="value" id="rate">&mdash;</div></div>
+  <div class="card"><div class="label">Points / scan</div><div class="value" id="count">&mdash;</div></div>
+  <div class="card"><div class="label">Last update</div><div class="value small" id="age">&mdash;</div></div>
+</div>
+
+<script>
+const canvas = document.getElementById('scan');
+const ctx = canvas.getContext('2d');
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('statusText');
+const nearestEl = document.getElementById('nearest');
+const rateEl = document.getElementById('rate');
+const countEl = document.getElementById('count');
+const ageEl = document.getElementById('age');
+const filterToggle = document.getElementById('filterToggle');
+const minReturnInput = document.getElementById('minReturn');
+const interpolateToggle = document.getElementById('interpolateToggle');
+const filteredCountEl = document.getElementById('filteredCount');
+const interpolatedCountEl = document.getElementById('interpolatedCount');
+
+const MAX_RANGE_MM = 5600;
+// Gaps wider than this aren't interpolated even if the toggle is on --
+// a straight line across, say, an open doorway would be more misleading
+// than an honest hole. Widen this if real gaps (a window pane) are still
+// getting left blank; narrow it if interpolation is bridging real openings.
+const MAX_INTERP_GAP_DEG = 20;
+let prevScan = null;   // raw scan, filtered fresh each render so threshold changes apply live
+let lastScanTimes = [];
+
+// Real (non-interpolated) points only, for the HUD's "nearest" / point count.
+function filterScan(scan, minMm) {
+  const angles = [], distances = [];
+  let hidden = 0;
+  for (let i = 0; i < scan.angles.length; i++) {
+    if (scan.distances[i] >= minMm) {
+      angles.push(scan.angles[i]);
+      distances.push(scan.distances[i]);
+    } else {
+      hidden++;
+    }
+  }
+  return { angles, distances, hidden };
+}
+
+// Sharp/glancing reflections (glass, polished metal) often come back as 0
+// or a handful of mm rather than a real short distance. This drops points
+// below minMm and, where interpolate is on, linearly fills narrow gaps
+// from the surrounding real returns -- each filled point is flagged in
+// `interpolatedMask` so the renderer can draw it distinctly from a real
+// measurement. Gaps at the very ends of the sweep, and gaps wider than
+// MAX_INTERP_GAP_DEG, are left as genuine holes either way.
+function buildDisplayScan(rawScan, minMm, interpolate) {
+  const n = rawScan.angles.length;
+  const valid = rawScan.distances.map(d => d >= minMm);
+  const firstValid = valid.indexOf(true);
+  const lastValid = valid.lastIndexOf(true);
+  if (firstValid === -1) {
+    return { angles: [], distances: [], interpolatedMask: [], hiddenCount: n, interpolatedCount: 0 };
+  }
+
+  const angles = [], distances = [], interpolatedMask = [];
+  let hiddenCount = firstValid + (n - 1 - lastValid);
+  let interpolatedCount = 0;
+
+  let i = firstValid;
+  while (i <= lastValid) {
+    if (valid[i]) {
+      angles.push(rawScan.angles[i]);
+      distances.push(rawScan.distances[i]);
+      interpolatedMask.push(false);
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j <= lastValid && !valid[j]) j++;  // [i, j) is the run of bad points
+    const a0 = rawScan.angles[i - 1], a1 = rawScan.angles[j];
+    const d0 = rawScan.distances[i - 1], d1 = rawScan.distances[j];
+    const gapDeg = Math.abs(a1 - a0);
+
+    if (interpolate && gapDeg <= MAX_INTERP_GAP_DEG) {
+      for (let k = i; k < j; k++) {
+        const t = (rawScan.angles[k] - a0) / (a1 - a0);
+        angles.push(rawScan.angles[k]);
+        distances.push(d0 + t * (d1 - d0));
+        interpolatedMask.push(true);
+        interpolatedCount++;
+      }
+    } else {
+      hiddenCount += (j - i);
+    }
+    i = j;
+  }
+  return { angles, distances, interpolatedMask, hiddenCount, interpolatedCount };
+}
+
+// Split a display scan into runs of angularly-adjacent points, so a gap
+// left by buildDisplayScan (unfilled or too wide to interpolate) breaks
+// the outline instead of the renderer jumping straight across it.
+function toSegments(scan) {
+  const segments = [];
+  let cur = { angles: [], distances: [], mask: [] };
+  let prevAngle = null;
+  for (let i = 0; i < scan.angles.length; i++) {
+    const a = scan.angles[i];
+    if (prevAngle !== null && (a - prevAngle) > 1.5) {
+      if (cur.angles.length) segments.push(cur);
+      cur = { angles: [], distances: [], mask: [] };
+    }
+    cur.angles.push(a);
+    cur.distances.push(scan.distances[i]);
+    cur.mask.push(scan.interpolatedMask ? scan.interpolatedMask[i] : false);
+    prevAngle = a;
+  }
+  if (cur.angles.length) segments.push(cur);
+  return segments;
+}
+
+function resize() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * devicePixelRatio;
+  canvas.height = rect.height * devicePixelRatio;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function polarToXY(angleDeg, distMm, cx, cy, scale) {
+  // 0 degrees = straight up ("front" of the sensor); positive = clockwise.
+  const rad = (angleDeg - 90) * Math.PI / 180;
+  const r = distMm * scale;
+  return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+}
+
+function drawGrid(cx, cy, scale) {
+  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--grid');
+  ctx.lineWidth = 1;
+  ctx.font = '10px ui-monospace, monospace';
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-dim');
+
+  for (let m = 1; m <= 5; m++) {
+    const r = m * 1000 * scale;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, Math.PI * -1.17, Math.PI * 0.17, false);
+    ctx.stroke();
+    ctx.fillText(m + 'm', cx + 4, cy - r - 2);
+  }
+  // field-of-view boundary rays at +/-120 deg from front
+  for (const a of [-120, -60, 0, 60, 120]) {
+    const [x, y] = polarToXY(a, MAX_RANGE_MM, cx, cy, scale);
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  }
+  ctx.beginPath();
+  ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--grid-strong');
+  ctx.fill();
+}
+
+function drawScan(scan, cx, cy, scale, color, fill, interpColor) {
+  if (!scan || !scan.angles.length) return;
+  for (const segment of toSegments(scan)) {
+    if (segment.angles.length < 2) continue;  // a lone surviving point isn't worth a sliver
+
+    const points = segment.angles.map((a, i) => polarToXY(a, Math.min(segment.distances[i], MAX_RANGE_MM), cx, cy, scale));
+
+    if (fill) {
+      ctx.beginPath();
+      points.forEach(([x, y], i) => { if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); });
+      ctx.lineTo(cx, cy);
+      ctx.closePath();
+      ctx.fillStyle = fill;
+      ctx.fill();
+    }
+
+    // Stroke real vs. interpolated stretches separately so interpolated
+    // spans render dashed; each stretch borrows its neighbour's first
+    // point so the dash pattern doesn't leave a visible seam.
+    let start = 0;
+    for (let i = 1; i <= points.length; i++) {
+      if (i < points.length && segment.mask[i] === segment.mask[start]) continue;
+      ctx.beginPath();
+      ctx.setLineDash(segment.mask[start] ? [4, 3] : []);
+      for (let k = start; k < i; k++) {
+        const [x, y] = points[k];
+        if (k === start) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      if (i < points.length) ctx.lineTo(points[i][0], points[i][1]);
+      ctx.strokeStyle = segment.mask[start] ? (interpColor || color) : color;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      start = i;
+    }
+    ctx.setLineDash([]);
+  }
+}
+
+function activeFilterMm() {
+  return filterToggle.checked ? Math.max(0, Number(minReturnInput.value) || 0) : 0;
+}
+
+function interpolationActive() {
+  return filterToggle.checked && interpolateToggle.checked;
+}
+
+function render(rawScan) {
+  const minMm = activeFilterMm();
+  const interpOn = interpolationActive();
+  const display = buildDisplayScan(rawScan, minMm, interpOn);
+  filteredCountEl.textContent = display.hiddenCount;
+  interpolatedCountEl.textContent = display.interpolatedCount;
+
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const cx = w / 2, cy = h * 0.58;
+  const scale = (Math.min(w, h) * 0.42) / MAX_RANGE_MM;
+
+  drawGrid(cx, cy, scale);
+  if (prevScan) {
+    const prevDisplay = buildDisplayScan(prevScan, minMm, interpOn);
+    drawScan(prevDisplay, cx, cy, scale, 'rgba(255,122,51,0.15)', null);
+  }
+  drawScan(display, cx, cy, scale, '#ff7a33', 'rgba(255,122,51,0.16)', 'rgba(255,122,51,0.55)');
+
+  prevScan = rawScan;
+}
+
+function updateHud(rawScan) {
+  const scan = filterScan(rawScan, activeFilterMm());
+  const finite = scan.distances.filter(d => d > 0);
+  const nearest = finite.length ? Math.min(...finite) : null;
+  nearestEl.textContent = nearest ? (nearest / 1000).toFixed(2) + ' m' : '—';
+  countEl.textContent = scan.angles.length + ' / ' + rawScan.angles.length;
+
+  const now = performance.now();
+  lastScanTimes.push(now);
+  lastScanTimes = lastScanTimes.filter(t => now - t < 3000);
+  if (lastScanTimes.length > 1) {
+    const hz = (lastScanTimes.length - 1) / ((now - lastScanTimes[0]) / 1000);
+    rateEl.textContent = hz.toFixed(1) + ' Hz';
+  }
+  ageEl.textContent = 'now';
+}
+
+filterToggle.addEventListener('change', () => {
+  minReturnInput.disabled = !filterToggle.checked;
+  interpolateToggle.disabled = !filterToggle.checked;
+});
+
+const source = new EventSource('/stream');
+source.onopen = () => { dot.classList.add('live'); statusText.textContent = 'streaming'; };
+source.onerror = () => { dot.classList.remove('live'); statusText.textContent = 'reconnecting…'; };
+source.onmessage = (evt) => {
+  const scan = JSON.parse(evt.data);
+  render(scan);
+  updateHud(scan);
+};
+</script>
+</body>
+</html>
