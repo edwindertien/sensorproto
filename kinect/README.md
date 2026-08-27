@@ -20,22 +20,71 @@ the layout before touching libfreenect or the sensor.
 
 Homebrew's `libfreenect` bottle doesn't include the Python module (a past
 PR to add it was rejected upstream over a linking issue), so it needs a
-manual build:
+manual build. This recipe is the one actually verified working end to
+end on macOS (Apple Silicon, AppleClang 17, Python 3.11 via venv) — a
+plain `cmake .. -DBUILD_PYTHON3=ON` is not enough; each piece below
+addresses a specific failure hit along the way.
+
+**One source change is required first.** libfreenect's own
+`wrappers/python/CMakeLists.txt` links the extension module directly
+against `Python3_LIBRARIES`. On this toolchain that resolves to the
+*static* `libpython3.11.a`, which pulls a whole second copy of CPython's
+built-in modules (`_ssl`, `posix`, `gc`, ...) into `freenect.so` —
+two interpreters colliding in one process, which crashes on import with
+a segfault. Open `wrappers/python/CMakeLists.txt`, find (around line 66):
+
+```
+target_link_libraries(cython${Python_BUILD_VERSION}_freenect
+  freenect_sync
+  ${Python${Python_BUILD_VERSION}_LIBRARIES})
+```
+
+and delete the `${Python${Python_BUILD_VERSION}_LIBRARIES}` line, so it
+reads just:
+
+```
+target_link_libraries(cython${Python_BUILD_VERSION}_freenect
+  freenect_sync)
+```
+
+Then, with the venv for this project active (`source venv/bin/activate`,
+so `numpy` is already installed and CMake targets the right Python):
 
 ```
 brew install libusb cmake pkg-config
+pip install cython setuptools   # setuptools restores distutils, removed in Python 3.12+
+
 git clone https://github.com/OpenKinect/libfreenect
 cd libfreenect
+# apply the CMakeLists.txt edit above before configuring
+
+rm -rf build
 mkdir build && cd build
-cmake .. -DBUILD_PYTHON3=ON
+
+cmake .. \
+  -DBUILD_PYTHON3=ON \
+  -DBUILD_CPP=OFF \
+  -DPython3_EXECUTABLE=$(which python3) \
+  -DCMAKE_MODULE_LINKER_FLAGS="-undefined dynamic_lookup -Wl,-no_fixup_chains" \
+  -DCMAKE_INSTALL_PREFIX="$VIRTUAL_ENV" \
+  -DCMAKE_INSTALL_RPATH="$VIRTUAL_ENV/lib" \
+  -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+
 make
-sudo make install
+make install
 ```
 
-This installs a `freenect` module onto your system Python. If you're
-using a venv and it isn't picked up, check where `make install` put the
-`.so`/`.dylib` (`find / -name "freenect*" 2>/dev/null`) and either
-symlink it into your venv's site-packages or add it to `PYTHONPATH`.
+What each non-default flag is for, in case a future rebuild only hits
+some of these:
+
+| Flag | Fixes |
+|---|---|
+| `-DBUILD_CPP=OFF` | Skips libfreenect's C++ demo viewer, unrelated to Python bindings and broken by a separate stale-CommandLineTools issue on this machine |
+| `-DPython3_EXECUTABLE=$(which python3)` | Forces CMake to target the venv's Python, not Homebrew's system default |
+| `-DCMAKE_MODULE_LINKER_FLAGS="-undefined dynamic_lookup -Wl,-no_fixup_chains"` | Lets Python symbols resolve at runtime instead of statically, and keeps that compatible with newer macOS "chained fixups" linking |
+| `-DCMAKE_INSTALL_PREFIX="$VIRTUAL_ENV"` | Installs straight into the venv's site-packages, no manual symlinking |
+| `-DCMAKE_INSTALL_RPATH="$VIRTUAL_ENV/lib"` + `-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON` | Lets `freenect.so` actually find `libfreenect_sync.dylib` at import time |
+| CMakeLists.txt edit above | The actual crash fix — stops a second CPython from getting linked into the module |
 
 Sanity-check the driver on its own before involving Flask:
 

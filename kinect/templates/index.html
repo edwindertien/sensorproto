@@ -33,12 +33,20 @@
   .panels{ width:100%; max-width:1040px; display:grid; grid-template-columns:1fr 1fr; gap:14px; }
   .panel{
     background:var(--panel); border:1px solid var(--grid-strong); border-radius:12px;
-    overflow:hidden; display:flex; flex-direction:column;
+    overflow:hidden; display:flex; flex-direction:column; position:relative;
   }
   .panel .label{
     font-size:10px; letter-spacing:0.1em; text-transform:uppercase; color:var(--text-dim);
     padding:8px 12px; border-bottom:1px solid var(--grid);
+    display:flex; justify-content:space-between; align-items:center;
   }
+  .panel .label .subtoggle{ display:flex; gap:6px; }
+  .panel .label .subtoggle button{
+    background:transparent; border:1px solid var(--grid-strong); border-radius:4px;
+    color:var(--text-dim); font-family:inherit; font-size:9px; letter-spacing:0.05em;
+    text-transform:uppercase; padding:3px 7px; cursor:pointer;
+  }
+  .panel .label .subtoggle button.active{ color:var(--accent); border-color:var(--accent); }
   .panel img{ width:100%; display:block; aspect-ratio:4/3; object-fit:cover; background:#0d0f13; }
 
   .hud{ width:100%; max-width:1040px; display:grid; grid-template-columns:repeat(3, 1fr); gap:10px; }
@@ -61,8 +69,14 @@
 
 <div class="panels">
   <div class="panel">
-    <div class="label">RGB</div>
-    <img src="/rgb_feed" alt="RGB camera feed" onerror="markDown()" onload="markLive()" />
+    <div class="label">
+      <span id="videoLabelText">RGB</span>
+      <span class="subtoggle">
+        <button id="rgbModeBtn" class="active" title="Standard colour camera">Colour</button>
+        <button id="irModeBtn" title="The IR camera and colour camera share one video channel on this hardware -- one or the other, not both at once">Raw IR</button>
+      </span>
+    </div>
+    <img id="videoImg" src="/video_feed" alt="Camera feed" onerror="markDown()" onload="markLive()" />
   </div>
   <div class="panel">
     <div class="label">Depth</div>
@@ -81,9 +95,31 @@ const dot = document.getElementById('dot');
 const statusText = document.getElementById('statusText');
 const fpsEl = document.getElementById('fps');
 const nearestEl = document.getElementById('nearest');
+const rgbModeBtn = document.getElementById('rgbModeBtn');
+const irModeBtn = document.getElementById('irModeBtn');
+const videoLabel = document.getElementById('videoLabelText');
 
 function markLive(){ dot.classList.add('live'); statusText.textContent = 'streaming'; }
 function markDown(){ dot.classList.remove('live'); statusText.textContent = 'no signal'; }
+
+function applyVideoMode(mode) {
+  const isIr = mode === 'ir';
+  rgbModeBtn.classList.toggle('active', !isIr);
+  irModeBtn.classList.toggle('active', isIr);
+  videoLabel.textContent = isIr ? 'Raw IR (speckle pattern)' : 'RGB';
+}
+
+async function setVideoMode(mode) {
+  applyVideoMode(mode);  // optimistic; /stats will confirm shortly after
+  try {
+    await fetch('/set_video_mode?mode=' + mode);
+  } catch (e) {
+    // next pollStats() call will resync the UI if this failed silently
+  }
+}
+
+rgbModeBtn.addEventListener('click', () => setVideoMode('rgb'));
+irModeBtn.addEventListener('click', () => setVideoMode('ir'));
 
 async function pollStats() {
   try {
@@ -91,6 +127,7 @@ async function pollStats() {
     const data = await res.json();
     fpsEl.textContent = data.fps ? data.fps.toFixed(1) + ' Hz' : '—';
     nearestEl.textContent = data.nearest_mm ? (data.nearest_mm / 1000).toFixed(2) + ' m' : '—';
+    if (data.video_mode) applyVideoMode(data.video_mode);
     if (data.fps > 0) markLive(); else markDown();
   } catch (e) {
     markDown();
