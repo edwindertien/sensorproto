@@ -128,7 +128,18 @@ async function pollStats() {
     fpsEl.textContent = data.fps ? data.fps.toFixed(1) + ' Hz' : '—';
     nearestEl.textContent = data.nearest_mm ? (data.nearest_mm / 1000).toFixed(2) + ' m' : '—';
     if (data.video_mode) applyVideoMode(data.video_mode);
-    if (data.fps > 0) markLive(); else markDown();
+
+    if (data.fps > 0) {
+      markLive();
+    } else if (data.last_error) {
+      dot.classList.remove('live');
+      statusText.textContent = 'error: ' + data.last_error;
+    } else if (!data.frames_received) {
+      dot.classList.remove('live');
+      statusText.textContent = 'waiting for first frame\u2026';
+    } else {
+      markDown();
+    }
   } catch (e) {
     markDown();
   }

@@ -22,6 +22,8 @@ See this project's README for the full walkthrough and troubleshooting.
 from __future__ import annotations
 
 import math
+import queue
+import threading
 import time
 
 import numpy as np
@@ -56,6 +58,62 @@ def raw_depth_to_mm(raw: np.ndarray) -> np.ndarray:
     return (meters * 1000).astype(np.uint16)
 
 
+def _connect_with_timeout(device_index: int, timeout: float):
+    """Runs the actual connection attempt (warm-up reads + one validated
+    read) in a daemon thread with a timeout.
+
+    A stuck libusb call can block forever with no way to interrupt it
+    from Python -- there's no signal-checking opportunity inside a raw
+    blocking C call that never returns control to the interpreter. Doing
+    this on the calling thread directly (e.g. inside __init__, called
+    from main()) was found to freeze the entire process solid, including
+    Ctrl+C, since the main thread never gets back to a point where it can
+    notice a pending signal at all.
+
+    Moving the risky call into a separate thread and waiting on it with
+    queue.get(timeout=...) sidesteps that: that wait is a proper Python
+    synchronization primitive, which -- unlike a raw blocking C call --
+    does cooperate with signal delivery, so Ctrl+C stays responsive even
+    while this is waiting. The worker thread is daemon=True specifically
+    so that if it does hang forever, it can never block the process from
+    exiting either.
+    """
+    result_queue: queue.Queue = queue.Queue(maxsize=1)
+
+    def worker():
+        try:
+            t0 = time.time()
+            # A couple of warm-up reads, discarded -- the first frame or
+            # two right after a device is addressed can be stale or
+            # garbled while the sensor settles; this doesn't flush any
+            # OS/USB buffer directly, but it does mean the validated read
+            # below is checking a frame the sensor has actually settled
+            # into producing, not whatever was first in the pipe.
+            for _ in range(2):
+                freenect.sync_get_video(device_index)
+                freenect.sync_get_depth(device_index)
+            rgb, _ = freenect.sync_get_video(device_index)
+            raw_depth, _ = freenect.sync_get_depth(device_index)
+            result_queue.put(("ok", (rgb, raw_depth, time.time() - t0)))
+        except Exception as exc:
+            result_queue.put(("error", exc))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    try:
+        status, payload = result_queue.get(timeout=timeout)
+    except queue.Empty:
+        raise KinectError(
+            f"No response after {timeout:.0f}s -- the sensor stopped responding mid-read "
+            f"rather than returning an error. This usually means a previous session left "
+            f"it in a bad state."
+        )
+
+    if status == "error":
+        raise payload
+    return payload
+
+
 class KinectSource:
     """Real Kinect v1 via libfreenect.
 
@@ -66,13 +124,58 @@ class KinectSource:
     is always fetched regardless of video mode.
     """
 
-    def __init__(self, device_index: int = 0):
+    def __init__(self, device_index: int = 0, max_attempts: int = 5, retry_delay: float = 1.5, attempt_timeout: float = 8.0):
         if not HAVE_FREENECT:
             raise KinectError(
                 "freenect module not found -- libfreenect's Python bindings "
                 "need to be built from source. See README.md."
             )
         self._index = device_index
+
+        # Defensive: harmless no-op if nothing was running in this process,
+        # but cheap insurance against any leftover state if this is ever
+        # constructed more than once in the same process.
+        try:
+            freenect.sync_stop()
+        except Exception:
+            pass
+
+        print(f"[kinect] Connecting to device index {device_index}...")
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                rgb, raw_depth, elapsed = _connect_with_timeout(device_index, attempt_timeout)
+            except Exception as exc:
+                last_exc = exc
+                print(f"[kinect] Attempt {attempt}/{max_attempts} failed: {exc}")
+                if attempt < max_attempts:
+                    print(f"[kinect] Retrying in {retry_delay:.1f}s...")
+                    time.sleep(retry_delay)
+                continue
+
+            _sanity_check_frame("RGB", rgb, expected_shape=(480, 640, 3))
+            _sanity_check_frame("depth", raw_depth, expected_shape=(480, 640))
+
+            depth_mm = raw_depth_to_mm(raw_depth)
+            valid_mask = depth_mm > 0
+            valid_fraction = float(valid_mask.mean())
+
+            print(f"[kinect] Connected on attempt {attempt}/{max_attempts} ({elapsed:.2f}s).")
+            print(f"[kinect]   RGB frame:   shape={rgb.shape} dtype={rgb.dtype}")
+            print(f"[kinect]   Depth frame: shape={raw_depth.shape} dtype={raw_depth.dtype}, "
+                  f"{valid_fraction * 100:.1f}% valid pixels"
+                  + (f", range {int(depth_mm[valid_mask].min())}-{int(depth_mm[valid_mask].max())}mm"
+                     if valid_fraction > 0 else ""))
+            if valid_fraction < 0.05:
+                print("[kinect]   WARNING: fewer than 5% of depth pixels are valid -- "
+                      "is anything within roughly 0.4-4m of the sensor?")
+            return
+
+        raise KinectError(
+            f"Could not get a valid frame from the Kinect after {max_attempts} attempts. "
+            f"Last error: {last_exc}. Try unplugging and replugging the sensor (both USB "
+            f"cable and separate power supply), then restart this script."
+        )
 
     def get_frames(self, video_mode: str = VIDEO_MODE_RGB):
         """Returns (video_frame, depth_mm, video_mode).
@@ -91,6 +194,13 @@ class KinectSource:
             freenect.sync_stop()
 
 
+def _sanity_check_frame(name: str, frame, expected_shape: tuple) -> None:
+    if frame is None:
+        raise KinectError(f"{name} frame is None")
+    if tuple(frame.shape) != expected_shape:
+        raise KinectError(f"{name} frame has unexpected shape {frame.shape}, expected {expected_shape}")
+
+
 class SimulatedKinectSource:
     """Synthetic RGB/IR + depth frames at the Kinect's native 640x480, for
     building and testing the dashboard without hardware attached."""
@@ -98,6 +208,7 @@ class SimulatedKinectSource:
     WIDTH, HEIGHT = 640, 480
 
     def __init__(self):
+        print("[kinect] Using simulated source (--simulate) -- no hardware involved.")
         self._t0 = time.time()
         yy, xx = np.mgrid[0:self.HEIGHT, 0:self.WIDTH]
         self._xx = xx.astype(np.float32)

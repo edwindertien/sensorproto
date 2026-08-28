@@ -1,5 +1,0 @@
-flask>=3.0
-numpy>=1.26
-opencv-python>=4.9
-# `freenect` is NOT pip-installable -- it comes from building libfreenect
-# from source with -DBUILD_PYTHON3=ON. See README.md.
