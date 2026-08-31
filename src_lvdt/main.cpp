@@ -1,96 +1,187 @@
 #include <Arduino.h>
 #include "UniProto.h"
-#include "mod_adc.h"
 
-// ── Device ────────────────────────────────────────────────────────────────────
-// LVDT using PWM AC excitation (100 Hz) and filtered AC input.
-// PWM excitation output on pin 9 (Timer1 ~500 Hz default, or reconfigured).
-// Rectified/filtered sense voltage read on A0 (primary ref) and A1 (sense).
+// ── LVDT — Linear Variable Differential Transformer ──────────────────────────
+// Primary coil excited with anti-phase filtered PWM on pins 9 and 10.
+// Secondary coils wired in series opposition, differential output to GND + A1.
 //
-// The LVDT output is a ratio: Vsense / Vref.  At null position, ratio ≈ 0.5.
-// Displacement ∝ (ratio - 0.5).
+// Working principle:
+//   Pin 9  -> 100Ω + 1µF RC filter -> primary half A (0°)
+//   Pin 10 -> 100Ω + 1µF RC filter -> primary half B (180°, anti-phase)
+//   The two halves drive the primary coil differentially.
+//   Secondary coils in series opposition: when core is centred, the two
+//   induced voltages cancel (zero output). Displacement from centre causes
+//   an imbalance proportional to position.
+//   A1 = differential secondary output (with optional series capacitor)
 //
-// PWM note: actual excitation uses a low-pass RC filter on pin 9.
-//           Timer1 default on Uno ~490 Hz is acceptable for 100 Hz target.
-//           For better accuracy, use mod_adc block stream + FFT approach.
+// Signal: same frequency as excitation (100Hz here, 48 samples at 5kHz).
+// Position: amplitude of receiver / amplitude of excitation.
+//   At centre: receiver ≈ 0  → position = 0
+//   Displaced: receiver has amplitude proportional to displacement.
+//   Phase of receiver (0° or 180° vs excitation) tells direction.
 //
-// Stream 1: Vref (A0), Vsense (A1), ratio (f32), position_mm (f32, needs cal)
-// Params:
-//   !lvdt.cal_span:10.0        full-scale mm (half-stroke each side)
-//   !lvdt.pwm:127              excitation PWM duty (0..255)
+// Streams:
+//   1 "lvdt.pos"   : position f32 (-1.0 to +1.0 normalised, 0=centre)
+//   2 "lvdt.frame" : 480-sample raw capture frame (chunked, oscilloscope view)
+//                    Same format as synchro frame: id, off, count, raw bytes
+//
+// Commands:
+//   !lvdt.zero     zero position at current location
+//   !lvdt.scale    full-scale calibration factor (default 1.0)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#define EXCITATION_PIN 9
+#define FRAME_N   480
+#define CYCLE_N    48    // samples per excitation cycle (5kHz / 100Hz)
+#define CHUNK_N    60    // chunks per frame (480/60 = 8)
 
 UniProto proto(Serial, "LVDT");
 
-static float _calSpan = 10.0f;   // ±10 mm full stroke
-static uint8_t _pwmDuty = 127;
+// Sine table — 0°  phase for pin 9
+// Anti-phase for pin 10 = sineTable[(n + 24) % 48]  (24 = half cycle)
+static uint8_t _sine[CYCLE_N];
 
-static AdcModule::Config makeAdcCfg() {
-    auto c = AdcModule::defaultUno();
-    c.channelCount = 2;
-    c.channels[0]  = A0; // Vref (excitation after filter)
-    c.channels[1]  = A1; // Vsense (LVDT output after filter)
-    c.avgWindow    = 8;
-    c.vref         = 5.0f;
-    c.valuesCount  = 1;
-    c.values[0].id     = 1;
-    c.values[0].name   = "lvdt.raw";
-    c.values[0].schema = "u16,u16";
-    c.values[0].units  = "ref,sense";
-    c.values[0].selCount = 0;
-    return c;
+// Capture buffer
+static volatile uint8_t  _cap[FRAME_N];
+static volatile uint16_t _wIdx  = 0;
+static volatile uint16_t _fCnt  = 0;   // frame counter
+
+// Transmission state
+static uint16_t _txFId   = 0;
+static uint16_t _txOff   = 0;
+static bool     _txPend  = false;
+static uint16_t _lastFCnt = 0;
+static uint16_t _frameId  = 0;
+
+// Position
+static float _pos       = 0.0f;
+static float _zero_off  = 0.0f;
+static float _scale     = 1.0f;
+
+// Timer2 ISR counter (shared with both PWM outputs)
+static volatile uint16_t _z = 0;
+
+ISR(TIMER2_OVF_vect) {
+    TCNT2 = 0xCE;   // reload for 5kHz
+
+    // Anti-phase excitation:
+    // Pin 9  = sine at phase z
+    // Pin 10 = sine at phase z + 24 (180° = CYCLE_N/2)
+    analogWrite(9,  _sine[_z % CYCLE_N]);
+    analogWrite(10, _sine[(_z + CYCLE_N/2) % CYCLE_N]);
+
+    // Sample receiver
+    _cap[_wIdx] = (uint8_t)(analogRead(A1) >> 2);
+
+    _z++;
+    _wIdx++;
+    if (_wIdx >= FRAME_N) { _wIdx = 0; _fCnt++; }
 }
-AdcModule rawAdc(makeAdcCfg());
 
-// computed stream
-static float _ratio = 0.5f, _posMm = 0.0f;
-static uint16_t _vref_raw = 512, _vsense_raw = 512;
+// ── Position computation ──────────────────────────────────────────────────────
+// Correlate captured signal against reference sine to get amplitude and phase.
+// Amplitude = peak of cross-correlation → magnitude of displacement.
+// Phase (0° or 180° vs reference) → sign of displacement.
+static float computePos() {
+    // Use the last complete cycle ending at _wIdx
+    uint16_t base = (_wIdx + FRAME_N - CYCLE_N) % FRAME_N;
 
-static void emitLvdt(UniProto& p, uint8_t sid, UniFrameWriter& w, void* /*ctx*/) {
-    _vref_raw   = (uint16_t)analogRead(A0);
-    _vsense_raw = (uint16_t)analogRead(A1);
-    float vref   = (_vref_raw   / 1023.0f) * 5.0f;
-    float vsense = (_vsense_raw / 1023.0f) * 5.0f;
-    _ratio = (vref > 0.01f) ? (vsense / vref) : 0.5f;
-    _posMm = (_ratio - 0.5f) * 2.0f * _calSpan;
-    w.begin(sid);
-    w.u16(_vref_raw,   "vref");
-    w.u16(_vsense_raw, "vsense");
-    w.f32(_ratio,  "ratio", 4);
-    w.f32(_posMm,  "mm",    2);
-    w.end();
-}
-
-static bool getLvdt(UniProto&, const char* key, char* out, size_t outLen, void*) {
-    if (!strcmp(key, "lvdt.cal_span")) { snprintf(out, outLen, "%.2f", (double)_calSpan); return true; }
-    if (!strcmp(key, "lvdt.pwm"))      { snprintf(out, outLen, "%u", (unsigned)_pwmDuty);  return true; }
-    return false;
-}
-static bool setLvdt(UniProto&, const char* key, const char* value, void*) {
-    if (!strcmp(key, "lvdt.cal_span")) { _calSpan = UniProto::parseFloat(value); return true; }
-    if (!strcmp(key, "lvdt.pwm")) {
-        long v = UniProto::parseInt(value);
-        if (v < 0) v = 0; if (v > 255) v = 255;
-        _pwmDuty = (uint8_t)v;
-        analogWrite(EXCITATION_PIN, _pwmDuty);
-        return true;
+    float corr_sin = 0.0f, corr_cos = 0.0f;
+    for (uint16_t n = 0; n < CYCLE_N; n++) {
+        float v = (float)_cap[(base + n) % FRAME_N] - 127.0f;
+        float ref_sin = (float)_sine[n] - 127.0f;
+        float ref_cos = (float)_sine[(n + CYCLE_N/4) % CYCLE_N] - 127.0f;
+        corr_sin += v * ref_sin;
+        corr_cos += v * ref_cos;
     }
-    return false;
+
+    // Amplitude of correlation (normalised by expected max)
+    float amp   = sqrtf(corr_sin*corr_sin + corr_cos*corr_cos);
+    float phase = atan2f(corr_sin, corr_cos);   // sign tells direction
+
+    // Normalise: max correlation when signal = reference, amp ≈ 127²×CYCLE_N/2
+    float norm = amp / (127.0f * 127.0f * CYCLE_N / 2.0f);
+
+    // Apply direction: phase near 0 = positive, near ±π = negative
+    float pos = norm * (cosf(phase) >= 0 ? 1.0f : -1.0f);
+    return (pos - _zero_off) * _scale;
 }
 
+// ── Streams ───────────────────────────────────────────────────────────────────
+static void emitPos(UniProto&, uint8_t sid, UniFrameWriter& w, void*) {
+    _pos = computePos();
+    w.begin(sid); w.f32(_pos, "pos", 4); w.end();
+}
+
+static void emitFrame(UniProto&, uint8_t sid, UniFrameWriter& w, void*) {
+    if (!_txPend) {
+        if (_fCnt == _lastFCnt) return;
+        _lastFCnt = _fCnt;
+        _txPend  = true;
+        _txOff   = 0;
+        _txFId   = ++_frameId;
+    }
+
+    uint16_t remaining = FRAME_N - _txOff;
+    uint16_t count = (remaining < CHUNK_N) ? remaining : CHUNK_N;
+
+    uint8_t chunk[CHUNK_N];
+    for (uint16_t i = 0; i < count; i++) chunk[i] = _cap[_txOff + i];
+
+    w.begin(sid);
+    w.u16(_txFId, "id"); w.u16(_txOff, "off"); w.u16(count, "cnt");
+    w.bytes(chunk, count);
+    w.end();
+
+    _txOff += count;
+    if (_txOff >= FRAME_N) { _txPend = false; _txOff = 0; }
+}
+
+// ── Params ────────────────────────────────────────────────────────────────────
+static bool getParam(UniProto&, const char* k, char* out, size_t len, void*) {
+    if (!strcmp(k,"lvdt.scale")) { snprintf(out,len,"%.3f",(double)_scale);    return true; }
+    if (!strcmp(k,"lvdt.pos"))   { snprintf(out,len,"%.4f",(double)_pos);      return true; }
+    return false;
+}
+static bool setParam(UniProto&, const char* k, const char* v, void*) {
+    if (!strcmp(k,"lvdt.scale")) { _scale = UniProto::parseFloat(v); return true; }
+    return false;
+}
+static bool doZero(UniProto&, const char*, const char*, Stream& out, void*) {
+    _zero_off = computePos() / _scale;
+    out.println(F("lvdt.zero"));
+    return true;
+}
+
+// ── Setup / loop ──────────────────────────────────────────────────────────────
 void setup() {
-    analogWrite(EXCITATION_PIN, _pwmDuty);
+    // Build sine table
+    for (uint16_t n = 0; n < CYCLE_N; n++) {
+        float v = 127.0f * sinf(2.0f * (float)PI * n / CYCLE_N) + 127.0f;
+        _sine[n] = (uint8_t)v;
+    }
 
-    Serial.begin(115200);
+    pinMode(9,  OUTPUT);
+    pinMode(10, OUTPUT);
+
+    // Fast PWM on Timer1 (pins 9, 10): no prescale
+    TCCR1B = (1<<CS10);   // prescale 1
+
+    // Timer2: 5kHz ISR (not used for PWM output — analogWrite handles that)
+    TCCR2A = 0;
+    TCCR2B = 4;            // prescale 64
+    TIMSK2 = 1<<TOIE2;
+    TCNT2  = 0xCE;
+
+    Serial.begin(38400);   // conservative — Timer2 ISR is timing-critical
     proto.begin();
-    proto.setRateHz(50);
+    proto.setRateHz(20);
 
-    proto.registerStream({2, "lvdt", "u16,u16,f32,f32", "vref,vsense,ratio,mm", emitLvdt, nullptr});
+    proto.registerStream({1,"lvdt.pos",  "f32",                "pos",          emitPos,   nullptr});
+    proto.registerStream({2,"lvdt.frame","u16,u16,u16,u8[block]","id,off,cnt,raw",emitFrame,nullptr});
 
-    proto.registerParam({"lvdt.cal_span", UniProto::ParamType::FLOAT, getLvdt, setLvdt, nullptr});
-    proto.registerParam({"lvdt.pwm",      UniProto::ParamType::INT32, getLvdt, setLvdt, nullptr});
+    proto.registerParam({"lvdt.scale", UniProto::ParamType::FLOAT, getParam,setParam,nullptr});
+    proto.registerParam({"lvdt.pos",   UniProto::ParamType::FLOAT, getParam,setParam,nullptr});
+    proto.registerAction({"lvdt.zero", doZero, nullptr});
 }
 
 void loop() {
