@@ -129,7 +129,7 @@ static void emitFrame(UniProto&, uint8_t sid, UniFrameWriter& w, void*) {
 
     w.begin(sid);
     w.u16(_txFId, "id"); w.u16(_txOff, "off"); w.u16(count, "cnt");
-    w.bytes(chunk, count);
+    for (uint16_t i = 0; i < count; i++) w.u16(chunk[i], "s");
     w.end();
 
     _txOff += count;
@@ -177,7 +177,7 @@ void setup() {
     proto.setRateHz(20);
 
     proto.registerStream({1,"lvdt.pos",  "f32",                "pos",          emitPos,   nullptr});
-    proto.registerStream({2,"lvdt.frame","u16,u16,u16,u8[block]","id,off,cnt,raw",emitFrame,nullptr});
+    proto.registerStream({2,"lvdt.frame","u16,u16,u16,...","id,off,cnt,s0..sN",emitFrame,nullptr});
 
     proto.registerParam({"lvdt.scale", UniProto::ParamType::FLOAT, getParam,setParam,nullptr});
     proto.registerParam({"lvdt.pos",   UniProto::ParamType::FLOAT, getParam,setParam,nullptr});

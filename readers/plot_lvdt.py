@@ -2,20 +2,18 @@
 """
 LVDT — Linear Variable Differential Transformer visualiser.
 
-Stream 1: lvdt.pos  — single f32 position value (-1 to +1)
-Stream 2: lvdt.frame — 480-sample frame chunks (id, off, cnt, raw bytes)
+Stream 1: lvdt.pos  — f32 position (-1 to +1)
+Stream 2: lvdt.frame — frame chunks: id, off, cnt, s0..sN (CSV integers)
 
 Layout:
-  Top    : AC waveform oscilloscope (480-sample frame, ~10 excitation cycles)
-           Shows excitation reference overlaid with received signal.
-           Phase and amplitude reveal core position.
-  Bottom : Position strip chart (-1 to +1, 0 = centre)
-           Large position readout.
+  Top    : Full 480-sample oscilloscope (receiver + reference overlay)
+  Middle : Single cycle zoom (last cycle, shows phase shift clearly)
+  Bottom : Position strip chart + large readout
 
 Usage:
   python plot_lvdt.py --port /dev/tty.usbmodemXXXX
 """
-import argparse, time, struct
+import argparse, time
 from collections import deque
 import numpy as np
 import matplotlib
@@ -25,9 +23,9 @@ import matplotlib.gridspec as gridspec
 from matplotlib.widgets import Button
 import serial
 
-FRAME_N  = 480
-CYCLE_N  = 48
-POS_N    = 200
+FRAME_N = 480
+CYCLE_N = 48
+POS_N   = 200
 
 def write_cmd(ser, s):
     s = s.strip()
@@ -40,8 +38,8 @@ def send_and_wait(ser, cmd, pause=0.15):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port",  required=True)
-    ap.add_argument("--baud",  type=int, default=38400)
+    ap.add_argument("--port", required=True)
+    ap.add_argument("--baud", type=int, default=38400)
     args = ap.parse_args()
 
     ser = serial.Serial(args.port, args.baud, timeout=0.0)
@@ -53,198 +51,183 @@ def main():
     time.sleep(0.3); ser.reset_input_buffer()
     print("[INFO] Ready.")
 
-    # Frame reassembly
-    frames      = {}   # frame_id -> bytearray of FRAME_N
-    last_frame  = np.zeros(FRAME_N)
-    frame_ready = [False]
+    # Frame assembly
+    frames     = {}   # fid -> np.ndarray(FRAME_N)
+    last_frame = np.full(FRAME_N, 127.0)
+    frame_count = [0]
 
-    # Position buffer
+    # Reference: sine 0..255 as the firmware generates on pin 9
+    ref_raw = np.array([127*np.sin(2*np.pi*n/CYCLE_N)+127 for n in range(CYCLE_N)])
+    ref_full = np.tile(ref_raw, FRAME_N//CYCLE_N)  # 480 samples, 0..255
+
+    # Position
     pos_buf  = deque([0.0]*POS_N, maxlen=POS_N)
     last_pos = [0.0]
 
-    # Reference sine (what pin 9 outputs, 0-255, normalised to -1..+1)
-    ref = np.array([np.sin(2*np.pi*n/CYCLE_N) for n in range(CYCLE_N)])
-    ref_full = np.tile(ref, FRAME_N//CYCLE_N)  # 480 samples
-
     # ── figure ────────────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(13, 8))
+    fig = plt.figure(figsize=(14, 9))
     fig.suptitle("LVDT — Linear Variable Differential Transformer", fontsize=12)
-    gs = gridspec.GridSpec(2, 2, figure=fig,
+    gs = gridspec.GridSpec(3, 2, figure=fig,
                            width_ratios=[3.0, 1.0],
-                           height_ratios=[1.5, 1.0],
-                           hspace=0.45, wspace=0.3)
+                           height_ratios=[1.4, 1.0, 1.0],
+                           hspace=0.5, wspace=0.3)
 
-    # Oscilloscope
+    x480 = np.arange(FRAME_N)
+    x48  = np.arange(CYCLE_N)
+
+    # Row 0: full frame oscilloscope
     ax_osc = fig.add_subplot(gs[0, 0])
-    x_osc  = np.arange(FRAME_N)
-    ref_line, = ax_osc.plot(x_osc, ref_full, color="#aaa", lw=0.7,
-                             ls="--", label="excitation ref", alpha=0.6)
-    sig_line, = ax_osc.plot(x_osc, np.zeros(FRAME_N), color="#2d7dd2",
-                             lw=1.0, label="receiver signal")
-    ax_osc.set_ylim(-1.5, 1.5)
+    ref_osc, = ax_osc.plot(x480, ref_full, color="#aaa", lw=0.7, ls="--",
+                            alpha=0.6, label="excitation ref (pin 9)")
+    sig_osc, = ax_osc.plot(x480, last_frame, color="#2d7dd2", lw=0.9,
+                            label="receiver (A1)")
+    ax_osc.set_ylim(-10, 265)
     ax_osc.set_xlim(0, FRAME_N)
-    ax_osc.set_ylabel("Amplitude (normalised)")
-    ax_osc.set_xlabel(f"samples  ({CYCLE_N} samples = 1 cycle = 10ms at 100Hz)")
-    ax_osc.set_title("AC waveform — 480 samples = 10 excitation cycles", fontsize=9)
-    ax_osc.legend(fontsize=7, loc="upper right")
-    ax_osc.axhline(0, color="gray", lw=0.4)
-    ax_osc.grid(True, alpha=0.25)
+    ax_osc.set_ylabel("ADC counts (0–255)")
+    ax_osc.set_xlabel(f"sample  ({CYCLE_N} per cycle = 10ms at 100Hz)")
+    ax_osc.set_title("480-sample frame — 10 excitation cycles", fontsize=9)
+    ax_osc.legend(fontsize=7, loc="upper right"); ax_osc.grid(True, alpha=0.25)
+    ax_osc.axhline(127, color="gray", lw=0.4, ls=":")
 
-    # Cycle zoom (show just one cycle)
+    # Row 1: single cycle zoom
     ax_cyc = fig.add_subplot(gs[1, 0])
-    x_cyc = np.arange(CYCLE_N)
-    refz_line, = ax_cyc.plot(x_cyc, ref, color="#aaa", lw=0.8, ls="--",
-                              label="excitation ref", alpha=0.6)
-    sigz_line, = ax_cyc.plot(x_cyc, np.zeros(CYCLE_N), color="#e84855",
-                              lw=1.2, label="receiver (last cycle)")
-    ax_cyc.set_ylim(-1.5, 1.5)
+    ref_cyc, = ax_cyc.plot(x48, ref_raw, color="#aaa", lw=0.8, ls="--",
+                            alpha=0.6, label="excitation ref")
+    sig_cyc, = ax_cyc.plot(x48, last_frame[-CYCLE_N:], color="#e84855",
+                            lw=1.3, label="receiver last cycle")
+    ax_cyc.set_ylim(-10, 265)
     ax_cyc.set_xlim(0, CYCLE_N-1)
-    ax_cyc.set_ylabel("Amplitude")
-    ax_cyc.set_xlabel("samples in one cycle")
-    ax_cyc.set_title("Single cycle zoom — phase shift = position direction", fontsize=9)
-    ax_cyc.legend(fontsize=7, loc="upper right")
-    ax_cyc.axhline(0, color="gray", lw=0.4)
-    ax_cyc.grid(True, alpha=0.25)
+    ax_cyc.set_ylabel("ADC counts")
+    ax_cyc.set_xlabel("sample in cycle")
+    ax_cyc.set_title("Single cycle zoom — amplitude=displacement, phase=direction", fontsize=9)
+    ax_cyc.legend(fontsize=7, loc="upper right"); ax_cyc.grid(True, alpha=0.25)
+    ax_cyc.axhline(127, color="gray", lw=0.4, ls=":")
 
-    # ── right panel ───────────────────────────────────────────────────────────
-    ax_pan = fig.add_subplot(gs[:, 1]); ax_pan.axis("off")
-
-    # Big position readout
-    pos_txt = fig.text(0.81, 0.72, "0.000",
-        fontsize=36, fontweight="bold", color="#2d7dd2",
-        ha="center", va="center")
-    fig.text(0.81, 0.64, "position (-1 to +1)", fontsize=8, color="gray",
-             ha="center", va="center")
-
-    # Position bar
-    ax_bar = fig.add_axes([0.76, 0.52, 0.16, 0.08])
-    ax_bar.set_xlim(-1.1, 1.1); ax_bar.set_ylim(0, 1)
-    ax_bar.axvline(0, color="gray", lw=0.5)
-    ax_bar.set_xticks([-1, -0.5, 0, 0.5, 1])
-    ax_bar.tick_params(axis='x', labelsize=7)
-    ax_bar.get_yaxis().set_visible(False)
-    ax_bar.set_frame_on(True)
-    pos_bar = ax_bar.barh([0.5], [0.0], height=0.6,
-                           color="#2d7dd2", align="center")[0]
-    ax_bar.set_title("position bar", fontsize=7)
-
-    PX, PW, BH, BG = 0.75, 0.22, 0.044, 0.007
-
-    def lbl(text, y):
-        fig.text(PX, y, text, fontsize=7.5, fontweight="bold", color="0.35")
-    def mkbtn(text, y, w=1.0, xoff=0.0, color="0.88"):
-        ax_b = fig.add_axes([PX+xoff*PW, y, PW*w-0.003, BH*0.85])
-        b = Button(ax_b, text, color=color, hovercolor="0.72")
-        b.label.set_fontsize(7); return b
-    def row3(y, items):
-        btns = []
-        for xi,(ltext,cmd) in enumerate(items):
-            ax_b = fig.add_axes([PX+xi*(PW/3), y, PW/3-0.003, BH*0.85])
-            b = Button(ax_b, ltext, color="0.88", hovercolor="0.72")
-            b.label.set_fontsize(6.5)
-            def mk(c): return lambda e: write_cmd(ser, c)
-            b.on_clicked(mk(cmd)); btns.append(b)
-        return btns
-
-    y = 0.48
-    lbl("── zero / calibrate ──", y); y -= BH*0.7
-    btn_zero  = mkbtn("@lvdt.zero", y, w=0.48, color="0.75")
-    btn_scale = mkbtn("?lvdt.pos",  y, w=0.48, xoff=0.52)
-    y -= BH + BG*2
-
-    lbl("── scale ──", y); y -= BH*0.7
-    _s_btns = row3(y, [("×0.5","!lvdt.scale:0.5"),("×1","!lvdt.scale:1.0"),("×2","!lvdt.scale:2.0")])
-    y -= BH + BG*2
-
-    lbl("── streams ──", y); y -= BH*0.7
-    btn_both = mkbtn("pos + frame", y, w=0.48, color="0.80")
-    btn_pos  = mkbtn("pos only",   y, w=0.48, xoff=0.52)
-    y -= BH + BG*2
-
-    lbl("── status ──", y); y -= BH*0.7
-    ax_log = fig.add_axes([PX, y-0.08, PW, 0.10])
-    ax_log.axis("off")
-    log_lines = [""]*4
-    log_txt = ax_log.text(0, 1, "", fontsize=6.5, va="top", family="monospace")
-    def log(msg):
-        log_lines.pop(0); log_lines.append(msg[:28])
-        log_txt.set_text("\n".join(log_lines)); fig.canvas.draw_idle()
+    # Row 2: position strip chart
+    ax_pos = fig.add_subplot(gs[2, 0])
+    t_ax   = list(range(-POS_N, 0))
+    pos_line, = ax_pos.plot(t_ax, list(pos_buf), color="#3bb273", lw=1.0)
+    ax_pos.axhline(0, color="gray", lw=0.5)
+    ax_pos.set_ylim(-1.2, 1.2)
+    ax_pos.set_ylabel("position"); ax_pos.set_xlabel("samples")
+    ax_pos.set_title("Position (0=centre, ±1=full scale)", fontsize=9)
+    ax_pos.grid(True, alpha=0.25)
 
     status = fig.text(0.01, 0.01, "pos=--  frames=0",
         fontsize=7.5, family="monospace", color="0.35")
 
-    btn_zero.on_clicked(lambda e: (write_cmd(ser,"@lvdt.zero"), log("zeroed")))
-    btn_scale.on_clicked(lambda e: log(f"pos={last_pos[0]:.4f}"))
-    btn_both.on_clicked(lambda e: (write_cmd(ser,"!stream:+1"),write_cmd(ser,"!stream:+2")))
-    btn_pos.on_clicked(lambda e:  (write_cmd(ser,"!stream:0"), write_cmd(ser,"!stream:+1")))
+    # ── right panel ───────────────────────────────────────────────────────────
+    ax_pan = fig.add_subplot(gs[:, 1]); ax_pan.axis("off")
 
-    plt.tight_layout(rect=[0, 0.04, 1, 0.96])
+    pos_txt = fig.text(0.81, 0.72, "+0.000",
+        fontsize=36, fontweight="bold", color="#3bb273",
+        ha="center", va="center")
+    fig.text(0.81, 0.65, "position", fontsize=9, color="gray",
+             ha="center", va="center")
+
+    ax_bar = fig.add_axes([0.755, 0.58, 0.18, 0.05])
+    ax_bar.set_xlim(-1.1, 1.1); ax_bar.set_ylim(0,1)
+    ax_bar.axvline(0, color="gray", lw=0.8)
+    ax_bar.set_xticks([-1, 0, 1]); ax_bar.tick_params(labelsize=7)
+    ax_bar.get_yaxis().set_visible(False)
+    pos_bar = ax_bar.barh([0.5],[0.0],height=0.5,color="#3bb273",align="center")[0]
+
+    PX, PW, BH, BG = 0.75, 0.22, 0.044, 0.007
+    def lbl(text,y): fig.text(PX,y,text,fontsize=7.5,fontweight="bold",color="0.35")
+    def mkbtn(text,y,w=1.0,xoff=0.0,color="0.88"):
+        ax_b=fig.add_axes([PX+xoff*PW,y,PW*w-0.003,BH*0.85])
+        b=Button(ax_b,text,color=color,hovercolor="0.72"); b.label.set_fontsize(7); return b
+    def row3(y,items):
+        btns=[]
+        for xi,(lt,cmd) in enumerate(items):
+            ax_b=fig.add_axes([PX+xi*(PW/3),y,PW/3-0.003,BH*0.85])
+            b=Button(ax_b,lt,color="0.88",hovercolor="0.72"); b.label.set_fontsize(6.5)
+            def mk(c): return lambda e: write_cmd(ser,c)
+            b.on_clicked(mk(cmd)); btns.append(b)
+        return btns
+
+    y=0.52
+    lbl("── zero / scale ──",y); y-=BH*0.7
+    btn_zero=mkbtn("@lvdt.zero",y,w=0.48,color="0.75")
+    btn_q=mkbtn("?lvdt.pos",y,w=0.48,xoff=0.52); y-=BH+BG*2
+    _s_btns=row3(y,[("×0.5","!lvdt.scale:0.5"),("×1","!lvdt.scale:1.0"),("×2","!lvdt.scale:2.0")])
+    y-=BH+BG*2
+
+    lbl("── streams ──",y); y-=BH*0.7
+    btn_both=mkbtn("pos+frame",y,w=0.48,color="0.80")
+    btn_pos=mkbtn("pos only",y,w=0.48,xoff=0.52); y-=BH+BG*2
+
+    ax_log=fig.add_axes([PX,y-0.10,PW,0.10]); ax_log.axis("off")
+    log_lines=[""]*4
+    log_txt=ax_log.text(0,1,"",fontsize=6.5,va="top",family="monospace")
+    def log(msg):
+        log_lines.pop(0); log_lines.append(msg[:28])
+        log_txt.set_text("\n".join(log_lines)); fig.canvas.draw_idle()
+
+    btn_zero.on_clicked(lambda e:(write_cmd(ser,"@lvdt.zero"),log("zeroed")))
+    btn_q.on_clicked(lambda e:log(f"pos={last_pos[0]:.4f}"))
+    btn_both.on_clicked(lambda e:(write_cmd(ser,"!stream:+1"),write_cmd(ser,"!stream:+2")))
+    btn_pos.on_clicked(lambda e:(write_cmd(ser,"!stream:0"),write_cmd(ser,"!stream:+1")))
+
+    plt.tight_layout(rect=[0,0.04,1,0.96])
     plt.show(block=False); plt.pause(0.1)
 
     # ── receive loop ──────────────────────────────────────────────────────────
-    rxbuf = b""; last_draw = time.time(); frame_count = [0]
+    rxbuf=b""; last_draw=time.time()
 
     try:
         while plt.fignum_exists(fig.number):
-            w = ser.in_waiting
-            if w: rxbuf += ser.read(w)
+            w=ser.in_waiting
+            if w: rxbuf+=ser.read(w)
 
-            new_pos = False; new_frame = False
+            new_pos=False; new_frame=False
             while b"\n" in rxbuf:
-                lb, rxbuf = rxbuf.split(b"\n", 1)
-                line = lb.decode("utf-8","ignore").strip()
+                lb,rxbuf=rxbuf.split(b"\n",1)
+                line=lb.decode("utf-8","ignore").strip()
                 if not line: continue
-                parts = [p.strip() for p in line.split(",")]
+                parts=[p.strip() for p in line.split(",")]
+                try:
+                    vals=[float(p) for p in parts]
+                except ValueError:
+                    continue
 
-                if len(parts) == 1:       # stream 1: position
+                n=len(vals)
+                if n==1:                          # stream 1: position
+                    last_pos[0]=vals[0]
+                    pos_buf.append(vals[0])
+                    new_pos=True
+                elif n>=4:                        # stream 2: frame chunk
                     try:
-                        p = float(parts[0])
-                        last_pos[0] = p
-                        pos_buf.append(p)
-                        new_pos = True
-                    except ValueError:
+                        fid=int(vals[0]); off=int(vals[1]); cnt=int(vals[2])
+                        samples=vals[3:3+cnt]
+                        if fid not in frames:
+                            frames[fid]=np.full(FRAME_N,127.0)
+                        frames[fid][off:off+cnt]=samples
+                        if off+cnt>=FRAME_N:
+                            last_frame[:]=frames.pop(fid)
+                            frame_count[0]+=1
+                            new_frame=True
+                    except (ValueError,IndexError):
                         pass
 
-                elif len(parts) >= 4:     # stream 2: frame chunk
-                    # format: id, off, cnt, b0, b1, ... bN
-                    try:
-                        fid   = int(parts[0])
-                        off   = int(parts[1])
-                        cnt   = int(parts[2])
-                        raw   = bytes([int(x) for x in parts[3:3+cnt]])
-                    except (ValueError, IndexError):
-                        continue
-                    if fid not in frames:
-                        frames[fid] = bytearray(FRAME_N)
-                    frames[fid][off:off+cnt] = raw
-                    if off + cnt >= FRAME_N:
-                        arr = np.frombuffer(frames[fid], dtype=np.uint8).astype(float)
-                        last_frame[:] = (arr - 127.0) / 127.0   # normalise to -1..+1
-                        del frames[fid]
-                        frame_count[0] += 1
-                        new_frame = True
-
-            now = time.time()
-            if (new_pos or new_frame) and (now - last_draw) >= 0.05:
-                last_draw = now
+            now=time.time()
+            if (new_pos or new_frame) and (now-last_draw)>=0.05:
+                last_draw=now
 
                 if new_frame:
-                    sig_line.set_ydata(last_frame)
-                    # Last cycle
-                    last_cycle = last_frame[-CYCLE_N:]
-                    sigz_line.set_ydata(last_cycle)
+                    sig_osc.set_ydata(last_frame)
+                    sig_cyc.set_ydata(last_frame[-CYCLE_N:])
 
-                pos_txt.set_text(f"{last_pos[0]:+.3f}")
-                color = "#e84855" if abs(last_pos[0]) > 0.8 else "#2d7dd2"
-                pos_txt.set_color(color)
-                # Position bar
-                pos_bar.set_width(last_pos[0])
-                pos_bar.set_x(min(0, last_pos[0]))
-                pos_bar.set_color(color)
+                t_ax=list(range(-POS_N,0))
+                pos_line.set_data(t_ax,list(pos_buf))
 
-                status.set_text(
-                    f"pos={last_pos[0]:+.4f}  frames={frame_count[0]}"
-                )
+                p=last_pos[0]
+                pos_txt.set_text(f"{p:+.3f}")
+                col="#e84855" if abs(p)>0.8 else "#3bb273"
+                pos_txt.set_color(col)
+                pos_bar.set_width(p); pos_bar.set_x(min(0,p)); pos_bar.set_color(col)
+
+                status.set_text(f"pos={p:+.4f}  frames={frame_count[0]}")
                 fig.canvas.draw_idle(); fig.canvas.flush_events()
 
             plt.pause(0.005)
@@ -254,5 +237,5 @@ def main():
     finally:
         write_cmd(ser,"!stream:0"); ser.close(); print("\n[INFO] Closed.")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
