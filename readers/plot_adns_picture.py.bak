@@ -5,7 +5,7 @@ import time
 import sys
 
 import matplotlib
-import uniproto_backend  # noqa          # macOS: use TkAgg so plt.ion() + plt.pause() work
+matplotlib.use("MacOSX")          # macOS: use TkAgg so plt.ion() + plt.pause() work
                                   # if TkAgg not available try: matplotlib.use("Qt5Agg")
 import matplotlib.pyplot as plt
 import serial

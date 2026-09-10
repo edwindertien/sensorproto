@@ -17,7 +17,7 @@ import argparse, time
 from collections import deque
 
 import matplotlib
-import uniproto_backend  # noqa
+matplotlib.use("MacOSX")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.widgets import Button, TextBox

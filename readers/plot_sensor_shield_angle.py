@@ -17,7 +17,7 @@ import argparse, time
 from collections import deque
 import numpy as np
 import matplotlib
-matplotlib.use("MacOSX")
+import uniproto_backend  # noqa
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 import serial

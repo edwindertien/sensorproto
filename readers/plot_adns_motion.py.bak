@@ -14,7 +14,7 @@ import time
 from collections import deque
 
 import matplotlib
-import uniproto_backend  # noqa   # Linux: change to "TkAgg" or "Qt5Agg"
+matplotlib.use("MacOSX")   # Linux: change to "TkAgg" or "Qt5Agg"
 import matplotlib.pyplot as plt
 import numpy as np
 import serial
