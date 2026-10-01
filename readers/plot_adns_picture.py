@@ -76,8 +76,8 @@ def main():
     ap.add_argument("--baud",       type=int, default=115200)
     ap.add_argument("--stream",     type=int, default=7)
     ap.add_argument("--rate",       type=int, default=200)
-    ap.add_argument("--continuous", action="store_true",
-                    help="auto-request new frame after each complete one")
+    ap.add_argument("--continuous", action="store_true", default=True,
+                    help="auto-request new frame after each complete one (default: on)")
     ap.add_argument("--flip_x",     action="store_true")
     ap.add_argument("--flip_y",     action="store_true")
     args = ap.parse_args()
