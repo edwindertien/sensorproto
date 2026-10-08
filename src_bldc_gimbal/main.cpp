@@ -5,6 +5,8 @@
 // ── Device ────────────────────────────────────────────────────────────────────
 // BLDC gimbal motor — minimal FOC, no SimpleFOC library.
 // DRV8313 driver (3-PWM) + AS5600 absolute magnetic encoder (I2C).
+// 
+// The DRV8313 needs 12V, the AS5600 needs 3.3V.
 //
 // Wiring:
 //   DRV8313 IN1 → pin 9    (phase A, Timer1 OC1A)
