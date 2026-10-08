@@ -1,0 +1,19 @@
+# UniProto sensor reader dependencies
+# Install with:  pip install -r requirements.txt
+
+# Serial communication (all readers, and the launcher's port list)
+pyserial>=3.5
+
+# Plotting (all visualisers)
+matplotlib>=3.7
+numpy>=1.24
+
+# Web tools: the launcher (launcher.py) and plot_sensor_shield_flask.py
+flask>=3.0
+
+# Drum sounds (plot_piezo_serial.py only — safe to skip if you do not use the piezo pads)
+pygame>=2.4
+
+# Optional, Windows/Linux only: lets matplotlib use Qt instead of Tk for the plot windows.
+# On macOS the plot windows use the native backend and never need Tk or Qt.
+# pyqt5>=5.15

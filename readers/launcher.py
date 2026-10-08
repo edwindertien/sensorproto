@@ -1,55 +1,61 @@
 #!/usr/bin/env python3
 """
-UniProto launcher — pick a serial port once, click a setup, its reader starts.
+UniProto launcher (web) — pick a serial port once, click a setup, its reader starts.
 
-  python launcher.py                 open the launcher
-  python launcher.py --port COM3     ...with a port preselected
-  python launcher.py --check         list which reader scripts / icons exist
-  python launcher.py --list-ports    list serial ports and exit
+  python launcher.py                  start the launcher and open http://127.0.0.1:5050
+  python launcher.py --port COM3      ...with a port preselected
+  python launcher.py --flask-port N   serve on another port (default 5050)
+  python launcher.py --no-browser     do not open the browser automatically
+  python launcher.py --check          list which reader scripts / icons exist, and exit
+  python launcher.py --list-ports     list serial ports, and exit
 
 What a click does:
-  * starts  <python> readers/<script> --port <selected port>  as its own process
-    (same Python / venv as the launcher, so every reader keeps its own window)
-  * only ONE reader may hold the serial port at a time — the launcher blocks a
-    second one until the first window is closed
+  * starts  <python> readers/<script> --port <port in the box>  as its own process
+    (same Python / venv as the launcher; every reader keeps its own plot window)
+  * only ONE reader may hold the serial port at a time — a second one is refused
+    until the first window is closed
   * Python-only readers (lidar, kinect) start without --port
-  * the row under the grid lists every reader of the selected setup
+  * the row under the grid lists every reader of the selected setup; "debug" readers
+    (raw probes) stay hidden until you tick "Show debug readers"
+  * a reader's script may live outside readers/ (give a path relative to readers/
+    in setups.py); it is then started from its own folder
 
-Close reader windows with the window's × button (not Ctrl-C): the Leonardo
-needs the clean close to drop DTR, see docs/context.md.
+Close reader windows with the window's × button (not Ctrl-C): the Leonardo needs the
+clean close to drop DTR, see docs/context.md.
 
-The setup list, scripts and icons all come from readers/setups.py.
-Needs tkinter (bundled with python.org installers; Linux: sudo apt install
-python3-tk; Homebrew: brew install python-tk) and pyserial (for the port list).
+The server only starts scripts listed in setups.py, binds to 127.0.0.1 by default and
+accepts JSON posts from its own page only. Needs: flask, pyserial (requirements.txt).
+No tkinter involved.
 """
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
-from setups import SETUPS, GROUPS, GRID_COLS, Reader, Setup   # noqa: E402
+from setups import SETUPS, GROUPS, GRID_COLS, NOT_SETUPS, Reader, Setup   # noqa: E402
 
 SETTINGS = Path.home() / ".uniproto_launcher.json"
 LOG_DIR = Path(tempfile.gettempdir()) / "uniproto_launcher"
-
-# ── layout ────────────────────────────────────────────────────────────────────
-ICON = 96
-CELL_W, CELL_H = 146, 150
-PAD = 12
-BG = "#F4F4F2"
+ICONS = ROOT / "docs" / "icons"
+DEFAULT_FLASK_PORT = 5050            # not 5000: macOS AirPlay Receiver sits on 5000
 IDLE_HELP = ("Click an icon to start its reader.  Close reader windows with the "
              "window's × button, not Ctrl-C (the Leonardo needs a clean close).")
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
-# ── pure helpers (no GUI; unit-tested) ────────────────────────────────────────
+# ── pure helpers (no web; unit-tested) ────────────────────────────────────────
 def find_ports():
     """[(device, description, likely_arduino)] — Arduino-like first."""
     try:
@@ -70,12 +76,24 @@ def find_ports():
     return out
 
 
+def valid_port(port: str) -> bool:
+    """A port string goes into argv: no spaces, never looks like an option."""
+    return bool(re.fullmatch(r"[A-Za-z0-9_./:@+\\-]{1,200}", port)) and not port.startswith("-")
+
+
 def script_path(reader: Reader, readers_dir: Path = HERE) -> Path:
-    return Path(readers_dir) / reader.script
+    return (Path(readers_dir) / reader.script).resolve()
 
 
 def reader_available(reader: Reader, readers_dir: Path = HERE) -> bool:
     return script_path(reader, readers_dir).is_file()
+
+
+def primary_reader(setup: Setup, readers_dir: Path = HERE):
+    """What a click starts: the first available non-debug reader, else the first available."""
+    avail = [r for r in setup.readers if reader_available(r, readers_dir)]
+    normal = [r for r in avail if not r.debug]
+    return (normal or avail or [None])[0]
 
 
 def build_command(reader: Reader, port: str, readers_dir: Path = HERE):
@@ -93,12 +111,6 @@ def last_log_line(path: Path) -> str:
         return ""
 
 
-def tint(hexcolor: str, f: float) -> str:
-    """Blend a #rrggbb colour towards white by fraction f."""
-    r, g, b = (int(hexcolor[i:i + 2], 16) for i in (1, 3, 5))
-    return "#%02x%02x%02x" % tuple(int(c + (255 - c) * f) for c in (r, g, b))
-
-
 def load_settings():
     try:
         return json.loads(SETTINGS.read_text())
@@ -113,22 +125,30 @@ def save_settings(d):
         pass
 
 
-def check_report(readers_dir: Path = HERE, icons_dir: Path = ROOT / "docs" / "icons" / "sm"):
-    """Text table: which reader scripts / icons exist. Returns (text, n_missing)."""
-    lines, missing = [f"{'setup':16s} {'reader script':32s} status", "-" * 62], 0
+def check_report(readers_dir: Path = HERE, icons_dir: Path = ICONS / "sm"):
+    """Text table: reader scripts / icons that exist, and scripts nobody registered.
+    Returns (text, n_problems)."""
+    lines, missing = [f"{'setup':16s} {'reader script':40s} status", "-" * 70], 0
+    referenced = set()
     for s in SETUPS:
         if not s.readers:
-            lines.append(f"{s.id:16s} {'(no reader — firmware only)':32s} -")
+            lines.append(f"{s.id:16s} {'(no reader)':40s} -")
         for r in s.readers:
             ok = reader_available(r, readers_dir)
+            referenced.add(Path(r.script).name)
             missing += (not ok)
-            lines.append(f"{s.id:16s} {r.script:32s} {'ok' if ok else 'MISSING'}")
+            tag = ("ok" if ok else "MISSING") + ("  (debug)" if r.debug else "")
+            lines.append(f"{s.id:16s} {r.script:40s} {tag}")
+    present = {p.name for p in Path(readers_dir).glob("*.py")}
+    orphans = sorted(n for n in present - referenced - set(NOT_SETUPS) if n.startswith("plot_"))
     no_icon = [s.id for s in SETUPS if not (Path(icons_dir) / f"{s.id}.png").is_file()]
-    lines += ["", f"{missing} reader script(s) missing",
+    lines += ["", f"{missing} registered reader script(s) missing",
+              f"scripts in {Path(readers_dir).name}/ that are not in setups.py: {orphans if orphans else 'none'}",
               f"icons missing: {no_icon if no_icon else 'none'}"]
-    return "\n".join(lines), missing
+    return "\n".join(lines), missing + len(orphans)
 
 
+# ── process bookkeeping ───────────────────────────────────────────────────────
 @dataclass
 class Proc:
     popen: subprocess.Popen
@@ -140,302 +160,26 @@ class Proc:
     t0: float
 
 
-# ── GUI ───────────────────────────────────────────────────────────────────────
-def run_gui(port_hint="", readers_dir=HERE, icons_dir=ROOT / "docs" / "icons" / "sm"):
-    try:
-        import tkinter as tk
-        from tkinter import ttk
-    except ImportError:
-        sys.exit("tkinter is not installed.\n"
-                 "  Linux:    sudo apt install python3-tk\n"
-                 "  Homebrew: brew install python-tk\n"
-                 "  Windows/macOS python.org installers include it.")
-    app = make_launcher_class(tk, ttk)(port_hint, Path(readers_dir), Path(icons_dir))
-    app.mainloop()
+class Supervisor:
+    """Starts readers, notices when they end, keeps the last status message."""
 
+    def __init__(self, readers_dir: Path):
+        self.readers_dir = Path(readers_dir)
+        self.procs: list[Proc] = []
+        self.lock = threading.RLock()
+        self.status = {"id": 0, "text": IDLE_HELP, "err": False, "log": None}
 
-def make_launcher_class(tk, ttk):
-    class _Launcher(tk.Tk):
-        def __init__(self, port_hint, readers_dir, icons_dir):
-            super().__init__()
-            self.readers_dir, self.icons_dir = readers_dir, icons_dir
-            self.title("UniProto launcher")
-            self.configure(bg=BG)
-            self.resizable(False, False)
-            self.procs: list[Proc] = []
-            self.hover = -1
-            self.selected = -1
-            self._imgs = {}
-            self.cells = []
-            self._port_desc = {}
+    def say(self, text, err=False, log=None):
+        with self.lock:
+            self.status = {"id": self.status["id"] + 1, "text": text, "err": err, "log": log}
 
-            self._build_header(port_hint)
-            self._build_canvas()
-            self._build_footer()
-            self.refresh_ports(initial=True, hint=port_hint)
-            self._draw_grid()
-            self._refresh_states()
-            self.protocol("WM_DELETE_WINDOW", self._quit)
-            self.bind("<F5>", lambda e: self.refresh_ports())
-            self.after(500, self._poll)
-            self.after(4000, self._auto_refresh)
+    def port_holder(self):
+        return next((p for p in self.procs if p.reader.port), None)
 
-        # ── widgets ───────────────────────────────────────────────────────────
-        def _build_header(self, hint):
-            f = tk.Frame(self, bg=BG)
-            f.pack(fill="x", padx=PAD, pady=(10, 2))
-            tk.Label(f, text="Serial port", bg=BG, font=("Helvetica", 11, "bold")).pack(side="left")
-            self.port_var = tk.StringVar(value=hint)
-            self.combo = ttk.Combobox(f, textvariable=self.port_var, width=34)
-            self.combo.pack(side="left", padx=8)
-            self.combo.bind("<<ComboboxSelected>>", lambda e: self._port_changed())
-            self.combo.bind("<FocusOut>", lambda e: self._port_changed())
-            ttk.Button(f, text="Refresh", command=self.refresh_ports).pack(side="left")
-            self.port_info = tk.Label(f, text="", bg=BG, fg="#666", font=("Helvetica", 10))
-            self.port_info.pack(side="left", padx=10)
-
-        def _build_canvas(self):
-            w = PAD * 2 + GRID_COLS * CELL_W
-            h = PAD * 2 + (len(SETUPS) // GRID_COLS) * CELL_H
-            self.canvas = tk.Canvas(self, width=w, height=h, bg=BG, highlightthickness=0)
-            self.canvas.pack(padx=0, pady=0)
-            self.canvas.bind("<Motion>", self._on_motion)
-            self.canvas.bind("<Leave>", lambda e: self._set_hover(-1))
-            self.canvas.bind("<Button-1>", self._on_click)
-
-        def _build_footer(self):
-            leg = tk.Frame(self, bg=BG)
-            leg.pack(fill="x", padx=PAD)
-            for name, color in GROUPS:
-                chip = tk.Canvas(leg, width=12, height=12, bg=BG, highlightthickness=0)
-                chip.create_rectangle(0, 0, 12, 12, fill=color, outline="")
-                chip.pack(side="left", padx=(0, 4))
-                tk.Label(leg, text=name, bg=BG, fg="#555", font=("Helvetica", 9)).pack(side="left", padx=(0, 14))
-
-            self.alt = tk.Frame(self, bg=BG)
-            self.alt.pack(fill="x", padx=PAD, pady=(8, 0))
-
-            self.status_var = tk.StringVar(value=IDLE_HELP)
-            self.status = tk.Label(self, textvariable=self.status_var, bg=BG, fg="#333",
-                                   anchor="w", justify="left", wraplength=GRID_COLS * CELL_W - 10,
-                                   font=("Helvetica", 10))
-            self.status.pack(fill="x", padx=PAD, pady=(6, 10))
-
-        # ── ports ─────────────────────────────────────────────────────────────
-        def refresh_ports(self, initial=False, hint=""):
-            ports = find_ports()
-            self._port_desc = {d: desc for d, desc, _ in ports}
-            self.combo["values"] = [d for d, _, _ in ports]
-            cur = self.port_var.get().strip()
-            if initial and not cur:
-                saved = load_settings().get("port", "")
-                if saved in self._port_desc:
-                    cur = saved
-                else:
-                    likely = [d for d, _, lk in ports if lk]
-                    cur = likely[0] if likely else (ports[0][0] if ports else "")
-                self.port_var.set(cur)
-            self._port_changed(save=False)
-            if not initial:
-                self.say(f"{len(ports)} serial port(s) found." if ports
-                         else "No serial ports found — plug in the board, then Refresh (F5).")
-
-        def _auto_refresh(self):
-            try:
-                ports = find_ports()
-                self._port_desc = {d: desc for d, desc, _ in ports}
-                self.combo["values"] = [d for d, _, _ in ports]   # list only; keeps your text
-                self._port_changed(save=False)
-            finally:
-                self.after(4000, self._auto_refresh)
-
-        def _port_changed(self, save=True):
-            p = self.port_var.get().strip()
-            self.port_info.config(text=self._port_desc.get(p, "" if p in ("", None) else "(not in port list)"))
-            if save and p:
-                save_settings({"port": p})
-
-        # ── grid drawing ──────────────────────────────────────────────────────
-        def _icon(self, setup):
-            path = self.icons_dir / f"{setup.id}.png"
-            if setup.id not in self._imgs:
-                try:
-                    self._imgs[setup.id] = tk.PhotoImage(file=str(path))
-                except tk.TclError:
-                    self._imgs[setup.id] = None
-            return self._imgs[setup.id]
-
-        def _cell_xy(self, i):
-            return PAD + (i % GRID_COLS) * CELL_W, PAD + (i // GRID_COLS) * CELL_H
-
-        def _draw_grid(self):
-            c = self.canvas
-            for i, s in enumerate(SETUPS):
-                x0, y0 = self._cell_xy(i)
-                color = GROUPS[s.group][1]
-                bg = c.create_rectangle(x0 + 4, y0 + 4, x0 + CELL_W - 4, y0 + CELL_H - 4,
-                                        fill="white", outline="#DDDDD8", width=1)
-                cx = x0 + CELL_W // 2
-                img = self._icon(s)
-                if img:
-                    c.create_image(cx, y0 + 12 + ICON // 2, image=img)
-                else:
-                    c.create_rectangle(cx - ICON // 2, y0 + 12, cx + ICON // 2, y0 + 12 + ICON,
-                                       fill=color, outline="")
-                    c.create_text(cx, y0 + 12 + ICON // 2, text=s.id, fill="white",
-                                  font=("Helvetica", 9, "bold"), width=ICON - 8)
-                c.create_text(cx, y0 + 12 + ICON + 14, text=s.title,
-                              font=("Helvetica", 11, "bold"), fill="#222")
-                c.create_text(cx, y0 + 12 + ICON + 30, text=s.tagline,
-                              font=("Helvetica", 9), fill="#777", width=CELL_W - 14)
-                dot = c.create_oval(x0 + CELL_W - 26, y0 + 12, x0 + CELL_W - 12, y0 + 26,
-                                    fill="#2EB872", outline="white", width=2, state="hidden")
-                badge = c.create_text(cx, y0 + 12 + ICON - 8, text="no script",
-                                      font=("Helvetica", 8, "bold"), fill="white",
-                                      state="hidden")
-                badge_bg = c.create_rectangle(cx - 30, y0 + 12 + ICON - 16, cx + 30,
-                                              y0 + 12 + ICON, fill="#C0392B", outline="",
-                                              state="hidden")
-                c.tag_raise(badge)
-                self.cells.append(dict(bg=bg, dot=dot, badge=badge, badge_bg=badge_bg,
-                                       color=color))
-
-        def _setup_state(self, s):
-            """('running'|'ready'|'missing'|'info')"""
-            if any(p.setup is s for p in self.procs):
-                return "running"
-            if not s.readers:
-                return "info"
-            return "ready" if any(reader_available(r, self.readers_dir) for r in s.readers) else "missing"
-
-        def _refresh_states(self):
-            c = self.canvas
-            for i, s in enumerate(SETUPS):
-                st = self._setup_state(s)
-                cell = self.cells[i]
-                c.itemconfigure(cell["dot"], state="normal" if st == "running" else "hidden")
-                show_badge = "normal" if st == "missing" else "hidden"
-                c.itemconfigure(cell["badge_bg"], state=show_badge)
-                c.itemconfigure(cell["badge"], state=show_badge)
-                self._paint_cell(i)
-
-        def _paint_cell(self, i):
-            cell = self.cells[i]
-            hot = (i == self.hover)
-            sel = (i == self.selected)
-            self.canvas.itemconfigure(
-                cell["bg"],
-                fill=tint(cell["color"], 0.90) if sel else "white",
-                outline=cell["color"] if (hot or sel) else "#DDDDD8",
-                width=3 if hot else (2 if sel else 1))
-
-        # ── interaction ───────────────────────────────────────────────────────
-        def _index_at(self, x, y):
-            col, row = (x - PAD) // CELL_W, (y - PAD) // CELL_H
-            if 0 <= col < GRID_COLS and row >= 0:
-                i = int(row) * GRID_COLS + int(col)
-                if 0 <= i < len(SETUPS):
-                    return i
-            return -1
-
-        def _set_hover(self, i):
-            if i == self.hover:
-                return
-            old, self.hover = self.hover, i
-            if old >= 0:
-                self._paint_cell(old)
-            if i >= 0:
-                self._paint_cell(i)
-                s = SETUPS[i]
-                names = ", ".join(r.script for r in s.readers) or "no reader"
-                env = s.env or "python only"
-                self.say(f"{s.title} — {s.tagline}   |   board: {s.board}   |   env: {env}   |   {names}")
-                st = self._setup_state(s)
-                self.canvas.config(cursor="hand2" if st in ("ready", "running", "info") else "arrow")
-            else:
-                self.say(IDLE_HELP)
-                self.canvas.config(cursor="arrow")
-
-        def _on_motion(self, e):
-            self._set_hover(self._index_at(e.x, e.y))
-
-        def _on_click(self, e):
-            i = self._index_at(e.x, e.y)
-            if i >= 0:
-                self.click_setup(i)
-
-        def click_setup(self, i):
-            """What a click does — also callable from tests."""
-            s = SETUPS[i]
-            old, self.selected = self.selected, i
-            if old >= 0:
-                self._paint_cell(old)
-            self._paint_cell(i)
-            self._show_readers(s)
-            if not s.readers:
-                self.say(s.note or "This setup has no Python reader.")
-                return
-            avail = [r for r in s.readers if reader_available(r, self.readers_dir)]
-            if not avail:
-                self.say(f"✗ {s.readers[0].script} not found in {self.readers_dir}. "
-                         f"Add the script or fix the name in readers/setups.py.", err=True)
-                return
-            self.launch(s, avail[0])
-
-        def _show_readers(self, s):
-            for w in self.alt.winfo_children():
-                w.destroy()
-            if not s.readers:
-                return
-            tk.Label(self.alt, text=f"{s.title}:", bg=BG, font=("Helvetica", 10, "bold")).pack(side="left")
-            for r in s.readers:
-                ok = reader_available(r, self.readers_dir)
-                ttk.Button(self.alt, text=r.label, state="normal" if ok else "disabled",
-                           command=lambda r=r, s=s: self.launch(s, r)).pack(side="left", padx=4)
-
-        # ── launching ─────────────────────────────────────────────────────────
-        def port_holder(self):
-            return next((p for p in self.procs if p.reader.port), None)
-
-        def launch(self, s: Setup, r: Reader):
-            if any(p.reader is r for p in self.procs):
-                self.say(f"{r.script} is already running.")
-                return None
-            port = self.port_var.get().strip()
-            if r.port:
-                if not port:
-                    self.say("Select a serial port first (top left).", err=True)
-                    self.combo.focus_set()
-                    return None
-                busy = self.port_holder()
-                if busy:
-                    self.say(f"{busy.reader.script} still holds {busy.port}. Close its window "
-                             f"(× button) before starting {r.script}.", err=True)
-                    return None
-            cmd = build_command(r, port, self.readers_dir)
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
-            log_path = LOG_DIR / f"{Path(r.script).stem}.log"
-            fh = open(log_path, "w")
-            fh.write("$ " + " ".join(cmd) + "\n")
-            fh.flush()
-            env = dict(os.environ, PYTHONUNBUFFERED="1")
-            try:
-                popen = subprocess.Popen(cmd, cwd=str(self.readers_dir), stdout=fh,
-                                         stderr=subprocess.STDOUT, env=env)
-            except OSError as ex:
-                fh.close()
-                self.say(f"✗ could not start {r.script}: {ex}", err=True)
-                return None
-            p = Proc(popen, s, r, port if r.port else "", log_path, fh, time.time())
-            self.procs.append(p)
-            where = f" on {port}" if r.port else ""
-            self.say(f"▶ {r.script} started{where}.  Close its window (×) when done.")
-            self._refresh_states()
-            return p
-
-        def _poll(self):
-            done = [p for p in self.procs if p.popen.poll() is not None]
-            for p in done:
+    def poll(self):
+        """Reap finished readers and report them. Safe to call from anywhere."""
+        with self.lock:
+            for p in [p for p in self.procs if p.popen.poll() is not None]:
                 self.procs.remove(p)
                 p.log_fh.close()
                 rc = p.popen.returncode
@@ -443,30 +187,360 @@ def make_launcher_class(tk, ttk):
                     self.say(f"{p.reader.script} closed.")
                 else:
                     tail = last_log_line(p.log_path)
-                    self.say(f"✗ {p.reader.script} exited with code {rc}: {tail}\n(full log: {p.log_path})",
-                             err=True)
-            if done:
-                self._refresh_states()
-            self.after(500, self._poll)
+                    self.say(f"{p.reader.script} exited with code {rc}: {tail}",
+                             err=True, log=Path(p.reader.script).stem)
 
-        # ── misc ──────────────────────────────────────────────────────────────
-        def say(self, text, err=False):
-            self.status_var.set(text)
-            self.status.config(fg="#B03A2E" if err else "#333")
+    def launch(self, s: Setup, r: Reader, port: str):
+        """Returns (ok, message); also updates self.status."""
+        with self.lock:
+            self.poll()
+            if any(p.reader is r for p in self.procs):
+                msg = f"{r.script} is already running."
+                self.say(msg)
+                return False, msg
+            if r.port:
+                if not port:
+                    msg = "Select a serial port first (top left)."
+                    self.say(msg, err=True)
+                    return False, msg
+                busy = self.port_holder()
+                if busy:
+                    msg = (f"{busy.reader.script} still holds {busy.port}. Close its window "
+                           f"(× button) before starting {r.script}.")
+                    self.say(msg, err=True)
+                    return False, msg
+            cmd = build_command(r, port, self.readers_dir)
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = LOG_DIR / f"{Path(r.script).stem}.log"
+            fh = open(log_path, "w")
+            fh.write("$ " + " ".join(cmd) + "\n")
+            fh.flush()
+            env = dict(os.environ, PYTHONUNBUFFERED="1")
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(self.readers_dir)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+            try:
+                popen = subprocess.Popen(cmd, cwd=str(script_path(r, self.readers_dir).parent),
+                                         stdout=fh, stderr=subprocess.STDOUT, env=env)
+            except OSError as ex:
+                fh.close()
+                msg = f"could not start {r.script}: {ex}"
+                self.say(msg, err=True)
+                return False, msg
+            self.procs.append(Proc(popen, s, r, port if r.port else "", log_path, fh, time.time()))
+            msg = f"{r.script} started" + (f" on {port}" if r.port else "") + \
+                  ".  Close its window (×) when done."
+            self.say(msg)
+            return True, msg
 
-        def _quit(self):
-            running = [p for p in self.procs if p.popen.poll() is None]
-            if running:
-                names = ", ".join(p.reader.script for p in running)
-                print(f"[launcher] leaving running: {names}", flush=True)
-            self.destroy()
+    def setup_state(self, s: Setup):
+        """'running' | 'ready' | 'missing' | 'info'"""
+        if any(p.setup.id == s.id for p in self.procs):
+            return "running"
+        if not s.readers:
+            return "info"
+        return "ready" if primary_reader(s, self.readers_dir) else "missing"
 
-    return _Launcher
+
+# ── the web app ───────────────────────────────────────────────────────────────
+CSS = """
+*{box-sizing:border-box}
+body{margin:0;background:#F4F4F2;font-family:-apple-system,Helvetica,Arial,sans-serif;color:#222}
+.wrap{width:900px;margin:0 auto;padding:12px 12px 18px}
+.top{margin-bottom:8px}.top label{font-weight:bold;font-size:14px;margin-right:8px}
+#port{width:300px;padding:5px 6px;font-size:14px}
+button{font-size:13px;padding:5px 12px;margin-left:6px;border:1px solid #bbb;border-radius:5px;
+  background:#e9e9e6;cursor:pointer}
+button:hover{background:#dcdcd8}button:disabled{color:#999;cursor:default;background:#efefed}
+#portinfo{margin-left:10px;color:#666;font-size:13px}
+.grid{width:876px;font-size:0}
+.card{display:inline-block;vertical-align:top;width:138px;height:152px;margin:4px;padding:8px 4px 0;
+  background:#fff;border:1px solid #DDDDD8;text-align:center;font-size:12px;position:relative;
+  cursor:pointer;user-select:none}
+.card img{width:96px;height:96px;display:block;margin:0 auto 4px}
+.card .t{font-weight:bold;font-size:13px;color:#222}.card .s{color:#777;font-size:11px;margin-top:2px}
+.card.info,.card.missing{cursor:default}
+.card .dot{display:none;position:absolute;top:8px;right:14px;width:14px;height:14px;border-radius:7px;
+  background:#2EB872;border:2px solid #fff}
+.card.running .dot{display:block}
+.card .badge{display:none;position:absolute;left:39px;top:79px;width:60px;padding:1px 0;background:#C0392B;
+  color:#fff;font-size:10px;font-weight:bold}
+.card.missing .badge{display:block}
+.g0:hover,.g0.selected{border-color:#2B6CB0}.g1:hover,.g1.selected{border-color:#0F8B8D}
+.g2:hover,.g2.selected{border-color:#C96F1A}.g3:hover,.g3.selected{border-color:#7A4FB5}
+.card:hover{border-width:3px;padding:6px 2px 0}.card.selected{border-width:2px;padding:7px 3px 0;background:#F1F5FA}
+.legend{font-size:12px;color:#555;margin:8px 0 0;overflow:hidden}
+.legend i{display:inline-block;width:12px;height:12px;margin:0 4px -2px 0}
+.legend span{margin-right:14px}.legend label{float:right}
+#readers{margin-top:10px;min-height:30px;font-size:13px}#readers b{margin-right:6px}
+#status{margin-top:8px;font-size:13px;min-height:36px;color:#333}#status.err{color:#B03A2E}
+#status a{margin-left:8px}
+"""
+
+JS = r"""
+(function () {
+  var $ = function (s) { return document.querySelector(s); };
+  var state = null, selected = null, hover = null, lastStatusId = -1, current = null;
+  var showDebug = localStorage.getItem('showDebug') === '1';
+  $('#debug').checked = showDebug;
+
+  function api(path, body) {
+    var opt = body === undefined ? {} :
+      {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)};
+    return fetch(path, opt).then(function (r) { return r.json(); });
+  }
+  function setupById(id) { return state && state.setups.filter(function (s) { return s.id === id; })[0]; }
+
+  function say(text, err, log) {
+    var el = $('#status');
+    el.className = err ? 'err' : '';
+    el.textContent = text;
+    if (log) {
+      var a = document.createElement('a');
+      a.href = '/log/' + log; a.target = '_blank'; a.textContent = 'show log';
+      el.appendChild(a);
+    }
+  }
+  function showCurrent() { if (current) say(current.text, current.err, current.log); }
+
+  function visibleReaders(s) {
+    var normal = s.readers.filter(function (r) { return !r.debug; });
+    return (showDebug || !normal.length) ? s.readers : normal;
+  }
+  function info(s) {
+    var names = visibleReaders(s).map(function (r) { return r.script; }).join(', ') || 'no reader';
+    return s.title + ' — ' + s.tagline + '   |   board: ' + s.board + '   |   env: ' + (s.env || 'python only') +
+           '   |   ' + names;
+  }
+
+  function renderReaders() {
+    var box = $('#readers'); box.textContent = '';
+    var s = selected && setupById(selected);
+    if (!s || !s.readers.length) return;
+    var b = document.createElement('b'); b.textContent = s.title + ':'; box.appendChild(b);
+    visibleReaders(s).forEach(function (r) {
+      var btn = document.createElement('button');
+      btn.textContent = r.label + (r.debug ? ' (debug)' : '');
+      btn.disabled = !r.available;
+      btn.addEventListener('click', function () { launch(s.id, r.script); });
+      box.appendChild(btn);
+    });
+  }
+
+  function paint() {
+    state.setups.forEach(function (s) {
+      var el = document.getElementById('card-' + s.id);
+      el.classList.toggle('running', s.state === 'running');
+      el.classList.toggle('missing', s.state === 'missing');
+      el.classList.toggle('info', s.state === 'info');
+      el.classList.toggle('selected', s.id === selected);
+    });
+    var key = state.ports.map(function (p) { return p.device; }).join('|');
+    if (key !== paint.key) {                       // only touch the list when it changed
+      paint.key = key;
+      var dl = $('#portlist'); dl.textContent = '';
+      state.ports.forEach(function (p) {
+        var o = document.createElement('option'); o.value = p.device; o.label = p.description; dl.appendChild(o);
+      });
+    }
+    var cur = $('#port').value.trim();
+    var m = state.ports.filter(function (p) { return p.device === cur; })[0];
+    $('#portinfo').textContent = m ? m.description : (cur ? '(not in port list)' : '');
+    if (state.status.id !== lastStatusId) {
+      lastStatusId = state.status.id; current = state.status;
+      if (!hover) showCurrent();
+    }
+    renderReaders();
+  }
+
+  function refresh() {
+    return api('/api/state').then(function (s) { state = s; paint(); }).catch(function () {
+      say('Lost connection to the launcher (is it still running?)', true);
+    });
+  }
+
+  function launch(setupId, script) {
+    return api('/api/launch', {setup: setupId, reader: script, port: $('#port').value.trim()})
+      .then(function (res) { say(res.message, !res.ok); return refresh(); });
+  }
+
+  document.querySelectorAll('.card').forEach(function (el) {
+    var id = el.dataset.id;
+    el.addEventListener('click', function () { selected = id; if (state) paint(); launch(id, null); });
+    el.addEventListener('mouseenter', function () { hover = id; var s = setupById(id); if (s) say(info(s)); });
+    el.addEventListener('mouseleave', function () { hover = null; showCurrent(); });
+  });
+  $('#refresh').addEventListener('click', function () {
+    api('/api/state?rescan=1').then(function (s) {
+      state = s; paint();
+      say(s.ports.length + ' serial port(s) found.' + (s.ports.length ? '' : ' Plug in the board, then Refresh.'));
+    });
+  });
+  $('#debug').addEventListener('change', function () {
+    showDebug = this.checked; localStorage.setItem('showDebug', showDebug ? '1' : '0'); renderReaders();
+  });
+  $('#port').addEventListener('input', function () { if (state) paint(); });
+
+  refresh();
+  setInterval(refresh, 1000);
+})();
+"""
+
+PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>UniProto launcher</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>{{ css|safe }}</style></head>
+<body><div class="wrap">
+<div class="top"><label for="port">Serial port</label>
+<input id="port" list="portlist" value="{{ default_port }}" placeholder="/dev/tty.usbmodem…  or  COM3"
+ autocomplete="off" spellcheck="false"><datalist id="portlist"></datalist>
+<button id="refresh">Refresh</button><span id="portinfo"></span></div>
+<div class="grid">
+{% for s in setups %}<div class="card g{{ s.group }}" id="card-{{ s.id }}" data-id="{{ s.id }}"><img src="/icons/{{ s.id }}.png" alt=""><div class="t">{{ s.title }}</div><div class="s">{{ s.tagline }}</div><span class="dot"></span><span class="badge">no script</span></div>
+{% endfor %}</div>
+<div class="legend">{% for name, color in groups %}<span><i style="background:{{ color }}"></i>{{ name }}</span>{% endfor %}
+<label><input type="checkbox" id="debug"> Show debug readers</label></div>
+<div id="readers"></div>
+<div id="status">{{ idle }}</div>
+</div><script>{{ js|safe }}</script></body></html>
+"""
+
+
+def create_app(readers_dir=HERE, icons_dir=ICONS, default_port="", strict_host=True):
+    try:
+        from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file
+    except ImportError:
+        sys.exit("Flask is not installed. Run:  pip install -r requirements.txt")
+
+    readers_dir, icons_dir = Path(readers_dir), Path(icons_dir)
+    app = Flask(__name__)
+    sup = Supervisor(readers_dir)
+    app.sup = sup
+    by_id = {s.id: s for s in SETUPS}
+    cache = {"t": 0.0, "ports": []}
+
+    def ports(force=False):
+        if force or time.time() - cache["t"] > 3.0:
+            cache["ports"], cache["t"] = find_ports(), time.time()
+        return cache["ports"]
+
+    def choose_default():
+        if default_port:
+            return default_port
+        pl = ports()
+        saved = load_settings().get("port", "")
+        if any(d == saved for d, _, _ in pl):
+            return saved
+        likely = [d for d, _, lk in pl if lk]
+        return likely[0] if likely else (pl[0][0] if pl else "")
+
+    def watcher():
+        while True:
+            time.sleep(0.5)
+            try:
+                sup.poll()
+            except Exception:
+                pass
+    threading.Thread(target=watcher, daemon=True).start()
+
+    @app.before_request
+    def guard():
+        # only answer to loopback host names (DNS-rebinding guard) unless the user bound it elsewhere
+        if strict_host:
+            host = urlsplit("//" + request.host).hostname
+            if host not in LOOPBACK:
+                abort(403)
+        if request.method == "POST" and not request.is_json:
+            abort(415)           # a cross-site form post cannot send JSON without a CORS preflight
+
+    @app.get("/")
+    def index():
+        return render_template_string(PAGE, css=CSS, js=JS, setups=SETUPS, groups=GROUPS,
+                                      default_port=choose_default(), idle=IDLE_HELP)
+
+    @app.get("/icons/<sid>.png")
+    def icon(sid):
+        if sid not in by_id:
+            abort(404)
+        for d in (icons_dir, icons_dir / "sm"):
+            f = d / f"{sid}.png"
+            if f.is_file():
+                return send_file(f, mimetype="image/png")
+        color = GROUPS[by_id[sid].group][1]
+        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96"><rect width="96" height="96" '
+               f'rx="16" fill="{color}"/><text x="48" y="54" fill="#fff" font-size="12" font-family="sans-serif" '
+               f'text-anchor="middle">{sid}</text></svg>')
+        return Response(svg, mimetype="image/svg+xml")
+
+    @app.get("/api/state")
+    def api_state():
+        sup.poll()
+        pl = ports(force=bool(request.args.get("rescan")))
+        out = []
+        with sup.lock:
+            for s in SETUPS:
+                out.append({
+                    "id": s.id, "title": s.title, "tagline": s.tagline, "board": s.board, "env": s.env,
+                    "group": s.group, "state": sup.setup_state(s), "note": s.note,
+                    "readers": [{"script": r.script, "label": r.label, "debug": r.debug,
+                                 "available": reader_available(r, readers_dir)} for r in s.readers]})
+            running = [{"script": p.reader.script, "port": p.port, "pid": p.popen.pid,
+                        "secs": int(time.time() - p.t0)} for p in sup.procs]
+            status = dict(sup.status)
+        return jsonify(ports=[{"device": d, "description": desc, "likely": lk} for d, desc, lk in pl],
+                       setups=out, running=running, status=status)
+
+    @app.post("/api/launch")
+    def api_launch():
+        data = request.get_json(silent=True) or {}
+        s = by_id.get(data.get("setup"))
+        if s is None:
+            return jsonify(ok=False, message="unknown setup"), 400
+        port = str(data.get("port") or "").strip()
+        if port and not valid_port(port):
+            return jsonify(ok=False, message="that does not look like a serial port name"), 400
+        if not s.readers:
+            msg = s.note or "This setup has no Python reader."
+            sup.say(msg)
+            return jsonify(ok=False, message=msg)
+        want = data.get("reader")
+        if want:
+            r = next((x for x in s.readers if x.script == want), None)
+            if r is None:
+                return jsonify(ok=False, message="unknown reader for this setup"), 400
+            if not reader_available(r, readers_dir):
+                msg = f"{r.script} not found in {readers_dir}. Add the script or fix the name in readers/setups.py."
+                sup.say(msg, err=True)
+                return jsonify(ok=False, message=msg)
+        else:
+            r = primary_reader(s, readers_dir)
+            if r is None:
+                msg = (f"{s.readers[0].script} not found in {readers_dir}. "
+                       f"Add the script or fix the name in readers/setups.py.")
+                sup.say(msg, err=True)
+                return jsonify(ok=False, message=msg)
+        ok, msg = sup.launch(s, r, port)
+        if ok and r.port and port:
+            save_settings({"port": port})
+        return jsonify(ok=ok, message=msg)
+
+    @app.get("/log/<stem>")
+    def log(stem):
+        stems = {Path(r.script).stem for s in SETUPS for r in s.readers}
+        if stem not in stems:
+            abort(404)
+        f = LOG_DIR / f"{stem}.log"
+        text = f.read_text(errors="replace") if f.is_file() else "(no log yet)"
+        return Response("\n".join(text.splitlines()[-200:]) + "\n", mimetype="text/plain; charset=utf-8")
+
+    return app
 
 
 def main():
-    ap = argparse.ArgumentParser(description="UniProto launcher")
+    ap = argparse.ArgumentParser(description="UniProto launcher (web)")
     ap.add_argument("--port", default="", help="preselect a serial port")
+    ap.add_argument("--host", default="127.0.0.1", help="address to listen on (default: this computer only)")
+    ap.add_argument("--flask-port", type=int, default=DEFAULT_FLASK_PORT, help="web port (default 5050)")
+    ap.add_argument("--no-browser", action="store_true", help="do not open the browser")
     ap.add_argument("--check", action="store_true", help="list reader scripts / icons and exit")
     ap.add_argument("--list-ports", action="store_true", help="list serial ports and exit")
     args = ap.parse_args()
@@ -479,7 +553,21 @@ def main():
         text, _ = check_report()
         print(text)
         return
-    run_gui(args.port)
+
+    strict = args.host in ("127.0.0.1", "localhost", "::1")
+    if not strict:
+        print(f"WARNING: listening on {args.host} — anyone who can reach this address can start "
+              f"readers on this computer.", flush=True)
+    app = create_app(default_port=args.port, strict_host=strict)
+    url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '') else args.host}:{args.flask_port}"
+    print(f"UniProto launcher: {url}   (Ctrl-C to stop; readers keep running)", flush=True)
+    if not args.no_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        app.run(host=args.host, port=args.flask_port, threaded=True, use_reloader=False)
+    except OSError as ex:
+        sys.exit(f"Could not listen on port {args.flask_port}: {ex}\n"
+                 f"Try:  python launcher.py --flask-port {args.flask_port + 1}")
 
 
 if __name__ == "__main__":

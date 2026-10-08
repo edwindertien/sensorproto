@@ -52,18 +52,23 @@ Click an icon to jump to its section.
 <sub>Rows: 🟦 Motion & actuation  ·  🟩 Position & angle  ·  🟧 Force, touch & distance  ·  🟪 Bio, sound & vision</sub>
 <!-- GRID:END -->
 
-**Prefer clicking in a window?** Start the launcher — it shows this same grid, has a serial-port
-drop-down, and starts the matching reader when you click an icon:
+**Prefer clicking?** Start the launcher — a small Flask app that opens in your browser, shows this
+same grid, has a serial-port box with suggestions, and starts the matching reader when you click an icon:
 
 ```bash
-python readers/launcher.py            # F5 refreshes the port list
-python readers/launcher.py --check    # which reader scripts / icons exist?
+python readers/launcher.py                 # opens http://127.0.0.1:5050
+python readers/launcher.py --check         # which reader scripts / icons exist?
+python readers/launcher.py --flask-port 5051 --no-browser     # other web port, don't open a tab
 ```
 
-The launcher starts each reader as its own process with `--port <selected port>`. Only one reader
+It needs only `flask` and `pyserial` (both in `readers/requirements.txt`) — no tkinter. It listens on
+this computer only (`127.0.0.1`) and starts nothing that is not listed in `readers/setups.py`.
+The launcher starts each reader as its own process (a normal plot window) with `--port <port in the box>`. Only one reader
 can hold a serial port at a time, so a second one is refused until the first window is closed
 (use the window's **×** button — see [the Leonardo note](#troubleshooting)). Setups that have
 several readers (sensor shield, optical mouse, …) list all of them in the row under the grid.
+Raw-probe readers marked *debug* stay hidden until you tick **Show debug readers**, and a click never starts one.
+Setups without a Python reader show a hint instead.
 
 ## Quick start
 
@@ -80,7 +85,7 @@ python plot_dc_motor.py --port /dev/tty.usbmodem21201  # Windows: --port COM3
 ```
 
 Details for macOS / Windows / Linux, finding your port and Linux permissions: [`readers/SETUP.md`](readers/SETUP.md).
-The launcher additionally needs `tkinter` (bundled with python.org installers; Linux `sudo apt install python3-tk`; Homebrew `brew install python-tk`).
+Everything runs from the one virtual environment, including the launcher (Flask).
 
 ---
 
@@ -245,8 +250,11 @@ lib/modules/              mod_*.h/.cpp — reusable hardware drivers (motors, AD
 src_<setup>/main.cpp      wiring + registerWith() calls          (one folder per setup)
 readers/
   setups.py               the list of setups: names, readers, groups   ← launcher, icons and README grid read this
-  launcher.py             click-to-start launcher
-  plot_*.py               per-setup visualisers
+  launcher.py             click-to-start launcher (Flask, opens in the browser)
+  plot_*.py               per-setup visualisers (the *_debug ones are raw probes)
+  plot_adc_blocks.py      generic viewer for binary ADC-block streams (not tied to one setup)
+  sensorhost/             browser host (Web Serial, Chrome/Edge): open index.html
+  example.py              template for a new reader
   uniproto_backend.py     picks the matplotlib backend per OS
   requirements.txt  SETUP.md
 tools/
@@ -266,7 +274,7 @@ docs/
 
 # Setups
 
-Status: ✅ documented · 🚧 stub (hardware listed, details to follow).
+Status: ✅ documented · 🚧 stub (hardware listed, details to follow). No Python reader yet: bldc_servo, stepper, pneumatic, wiimote (use `pio device monitor`); piezo_midi is a MIDI device and needs none.
 
 <a id="bldc-gimbal"></a>
 ## BLDC gimbal — `bldc_gimbal` ✅
@@ -327,8 +335,10 @@ Two coupled motors for master–slave haptics: move one and the other follows (a
 **Hardware:** two Maxon motors with encoders · L293 driver · Uno. **Env:** `haptic` (firmware `src_haptic/`, driver `mod_motors`).
 **Stream 3:** `pos0, pos1, set0, set1, cmd0, cmd1, err0, err1`.
 **Commands:** `!stream:3`, `!motor0.enable:1`, `!motor0.kp:1.5`, `!motor0.set:500`, `!motor0.pwm:100`, `!motor0.pwm_lim:180`, `!motor.link:3` (bidirectional coupling), `!motor.link_scale:0.5`, `@motor.zero`, `@motor.stop`.
-**Readers:** `plot_dual_motor.py` — strip charts plus a command panel with presets; scrolling window of 100–2000 samples drawn from a larger circular history, **rec** (live CSV log) and **save buffer** (dump the history to CSV) ·
-`plot_motor_stream.py`, `plot_motor_stream_vel.py` (adds a velocity estimate) · `plot_motor_debug.py` (raw probe: shows what the Arduino sends).
+**Readers:** `plot_haptic_dual_motor.py` — strip charts plus a command panel with presets ·
+`plot_dual_motor.py` — the same monitor with a scrolling window of 100–2000 samples drawn from a larger circular history (`--history`), **rec** (live CSV log) and **save buffer** (dump the history to CSV) ·
+`plot_haptic_dual_motor_stream.py`, `plot_haptic_dual_motor_stream_vel.py` (adds a velocity estimate) ·
+`plot_haptic_dual_motor_debug.py` (*debug*: raw probe that shows what the Arduino sends).
 
 <a id="stepper"></a>
 ## Stepper — `stepper` 🚧
@@ -354,7 +364,7 @@ Linear variable differential transformer: a core sliding through a primary coil 
 ## Synchro — `synchro` 🚧 *(known issue)*
 
 Three-phase synchro transformer: the rotor angle is recovered from a filtered-PWM sine sent on three phases.
-**Wiring:** phases on pins 9 (0°), 5 (120°) and 10 (240°) · receiver on **A1**. Timer 2 interrupt at 5 kHz, 48-sample sine table, frames of 480 samples (10 cycles) sent in chunks of 60. **Baud 38 400.**
+**Wiring:** phases on pins 9 (0°), 5 (120°) and 10 (240°) · receiver on **A1**. Timer 2 interrupt at 5 kHz, 48-sample sine table, frames of 480 samples (10 cycles) sent in chunks of 60. **Baud 115 200** (the reader's default).
 Angle comes from cross-correlation. **Known issue:** the angle is still erratic because the ISR's capture array can be read while it is being written; double-buffering is planned.
 **Reader:** `plot_synchro.py`.
 
@@ -365,7 +375,7 @@ An ADNS-2610 optical-mouse sensor read over its bit-banged serial interface (A4/
 **Board:** Uno · module `mod_adns2610`.
 **Streams:** 6 `adns.motion` — `dx, dy` · 7 `adns.frame` — the image, in chunks of `id, w, h, off, n` + `n` six-bit pixels (binary format).
 **Params:** `adns.led` (illumination), `adns.capture` (`1` grabs one frame), `adns.motion_on` (`0` frees bandwidth during an image read), `adns.resync`; read-only diagnostics `adns.dx dy squal maxpix minpix pixsum shutter status`, and `adns.w adns.h adns.chunk_px`.
-**Readers:** `plot_adns_picture.py` (image; pass `--continuous` to keep refreshing, `--flip_x` / `--flip_y` to mirror) · `plot_adns_motion.py` (dx/dy trace) · `plot_adns_debug.py` (raw probe).
+**Readers:** `plot_adns_picture.py` (image; pass `--continuous` to keep refreshing, `--flip_x` / `--flip_y` to mirror) · `plot_adns_motion.py` (dx/dy trace) · `plot_adns_debug.py` (*debug*: raw probe).
 
 <a id="qtr8"></a>
 ## QTR-8 reflectance array — `qtr8` ✅
@@ -399,7 +409,7 @@ The Wiimote's infrared camera on I²C at 400 kHz. Board: Uno. Compiles; the came
 <a id="load-cell"></a>
 ## Load cell — `load_cell` ✅
 
-Single HX711 amplifier, channel A, gain 128. **Wiring:** DOUT = A3, SCK = A2. Board: Uno. **Reader:** `plot_load_cell.py` (and `plot_load_raw.py` for raw counts).
+Single HX711 amplifier, channel A, gain 128. **Wiring:** DOUT = A3, SCK = A2. Board: Uno. **Reader:** `plot_load_cell.py`.
 **Calibration:** 1. flash and open the reader · 2. remove all weight, click **zero** (tare) · 3. place a known weight · 4. enter it, click **calc scale** · 5. click **verify**.
 
 <a id="kitchen-scales"></a>
@@ -463,7 +473,7 @@ GSR is a slow signal — use **auto-fit** after attaching the electrodes. BPM is
 
 An optical-gate anemometer: an IR LED (A2/A3) and photodiode (A0/A1) count fan blades. Board: Uno.
 **Params:** `wind.thr` (pulse threshold, default 512), `wind.blades` (default 3), `wind.circ` (fan circumference in m, default 0.05).
-**Readers:** `plot_wind_speed.py` (**auto (midpoint)** sets the threshold from the live signal) · `plot_wind_raw.py` (raw signal).
+**Readers:** `plot_wind_speed.py` (**auto (midpoint)** sets the threshold from the live signal).
 
 <a id="piezo-serial"></a>
 ## Piezo drums (serial) — `piezo_serial` ✅
@@ -471,7 +481,7 @@ An optical-gate anemometer: an IR LED (A2/A3) and photodiode (A0/A1) count fan b
 Four piezo plates on **A0–A3** as drum pads, streamed for visualisation. **Board: Arduino Leonardo.**
 **Stream 1:** `A0, A1, A2, A3, dA0, dA1, dA2, dA3` — raw ADC plus an IIR-smoothed **derivative** (`d = (1-s)·d + s·(raw - prev)`, `s` = `piezo.smooth`, default 0.7).
 Trigger on the derivative, not the raw value: it ignores baseline drift, crosstalk and slow voltage build-up.
-**Reader:** `plot_piezo.py` — raw charts, derivative charts with the threshold, and four impact circles that glow with hit strength; each pad plays a synthesised kick, snare or hi-hat (pygame, no sound files; `--nosound` to disable). Buttons adjust the threshold and smoothing.
+**Reader:** `plot_piezo_serial.py` — raw charts, derivative charts with the threshold, and four impact circles that glow with hit strength; each pad plays a synthesised kick, snare or hi-hat (pygame, no sound files; `--nosound` to disable). Buttons adjust the threshold and smoothing.
 Drum map: A0 kick · A1 snare · A2 closed hi-hat · A3 open hi-hat.
 
 <a id="piezo-midi"></a>
@@ -503,8 +513,9 @@ Depth camera. Python only (no Arduino firmware).
 # Troubleshooting
 
 - **No data / `Port busy`.** Only one program can open a serial port. Close the Arduino IDE's serial monitor, the PlatformIO monitor and any other reader first.
-- **Leonardo / piezo reader hangs after the first run.** The Leonardo sketch waits (`while(!Serial)`) for DTR to rise. On macOS the OS can leave DTR high after a program ends, so the next run sees no edge. `plot_piezo.py` opens the port with DTR low → high and drops DTR again on close — which happens reliably only when you close the window with its **×** button — Ctrl-C can interrupt before DTR is dropped. Always close with ×.
+- **Leonardo / piezo reader hangs after the first run.** The Leonardo sketch waits (`while(!Serial)`) for DTR to rise. On macOS the OS can leave DTR high after a program ends, so the next run sees no edge. `plot_piezo_serial.py` opens the port with DTR low → high and drops DTR again on close — which happens reliably only when you close the window with its **×** button — Ctrl-C can interrupt before DTR is dropped. Always close with ×.
 - **macOS shows two ports per board** (`/dev/tty.usb…` and `/dev/cu.usb…`). The readers were developed with `tty.`; the launcher lists those first.
+- **Launcher: "Address already in use".** Another program has web port 5050 — start it with `--flask-port 5051`. (5000 is avoided on purpose: macOS uses it for AirPlay.)
 - **A reader says "not found" in the launcher.** Run `python readers/launcher.py --check`, then fix the script name in `readers/setups.py`.
 - **A reader dies immediately from the launcher.** The status line shows the last line of its error; the complete output is in `<temp dir>/uniproto_launcher/<script>.log`.
 - **Plots lag or freeze on a slow machine.** Lower `!rate:`, and for the dual-motor reader watch the `draw` and `rx` numbers in its status line: rising `draw` means plotting is the bottleneck, rising `rx` means the serial data is not being consumed fast enough.
