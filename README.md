@@ -44,7 +44,7 @@ Click an icon to jump to its section.
 <td align="center" valign="top" width="16%"><a href="#wind-speed"><img src="docs/icons/wind_speed.png" width="96" alt="Wind speed"><br><b>Wind speed</b></a><br><sub>optical anemometer</sub></td>
 <td align="center" valign="top" width="16%"><a href="#piezo-serial"><img src="docs/icons/piezo_serial.png" width="96" alt="Piezo drums"><br><b>Piezo drums</b></a><br><sub>stream + heatmap</sub></td>
 <td align="center" valign="top" width="16%"><a href="#piezo-midi"><img src="docs/icons/piezo_midi.png" width="96" alt="Piezo MIDI"><br><b>Piezo MIDI</b></a><br><sub>USB-MIDI drum kit</sub></td>
-<td align="center" valign="top" width="16%"><a href="#lidar"><img src="docs/icons/lidar.png" width="96" alt="Lidar"><br><b>Lidar</b></a><br><sub>2D laser scanner</sub></td>
+<td align="center" valign="top" width="16%"><a href="#lidar"><img src="docs/icons/lidar.png" width="96" alt="Lidar"><br><b>Lidar</b></a><br><sub>Hokuyo laser scanner</sub></td>
 <td align="center" valign="top" width="16%"><a href="#kinect"><img src="docs/icons/kinect.png" width="96" alt="Kinect"><br><b>Kinect</b></a><br><sub>depth camera</sub></td>
 </tr>
 </table>
@@ -69,6 +69,7 @@ can hold a serial port at a time, so a second one is refused until the first win
 several readers (sensor shield, optical mouse, …) list all of them in the row under the grid.
 Raw-probe readers marked *debug* stay hidden until you tick **Show debug readers**, and a click never starts one.
 Setups without a Python reader show a hint instead.
+The two PC-side apps, `kinect/app.py` and `hokuyo/app.py`, are started from their own folders without `--port`. They have no window to close, so they are listed under the grid with a **Stop** button; if an app prints a web address (e.g. Flask's `Running on http://127.0.0.1:…`), the launcher opens it and shows an *open* link.
 
 ## Quick start
 
@@ -245,6 +246,7 @@ keep the `Button` objects in a list (otherwise they are garbage-collected and st
 
 ```
 platformio.ini            one [env] per setup (board, libraries, build flags)
+kinect/app.py  hokuyo/app.py     the two PC-side apps (no Arduino); started by the launcher
 lib/uniproto/             UniProto + UniWriter                    (the library)
 lib/modules/              mod_*.h/.cpp — reusable hardware drivers (motors, ADNS-2610, HX711, …)
 src_<setup>/main.cpp      wiring + registerWith() calls          (one folder per setup)
@@ -499,14 +501,14 @@ The same four pads, but the Leonardo appears as a **USB-MIDI device**: a hit sen
 Remap by editing `NOTES[]` in `src_piezo_midi/main.cpp`. Library: MIDIUSB. Tune `THRESHOLD`, `PEAK_WINDOW` and `RETRIGGER` at the top of the sketch; use `piezo_serial` first to see what your pads actually deliver.
 
 <a id="lidar"></a>
-## Lidar — `lidar` 🚧
+## Lidar (Hokuyo) — `lidar` 🚧
 
-2D laser scanner. Python only (no Arduino firmware).
+Hokuyo 2D laser scanner. Python only (no Arduino firmware). **App:** `hokuyo/app.py`, started by the launcher from the `hokuyo/` folder.
 
 <a id="kinect"></a>
 ## Kinect — `kinect` 🚧
 
-Depth camera. Python only (no Arduino firmware).
+Depth camera. Python only (no Arduino firmware). **App:** `kinect/app.py`, started by the launcher from the `kinect/` folder.
 
 ---
 
@@ -516,6 +518,7 @@ Depth camera. Python only (no Arduino firmware).
 - **Leonardo / piezo reader hangs after the first run.** The Leonardo sketch waits (`while(!Serial)`) for DTR to rise. On macOS the OS can leave DTR high after a program ends, so the next run sees no edge. `plot_piezo_serial.py` opens the port with DTR low → high and drops DTR again on close — which happens reliably only when you close the window with its **×** button — Ctrl-C can interrupt before DTR is dropped. Always close with ×.
 - **macOS shows two ports per board** (`/dev/tty.usb…` and `/dev/cu.usb…`). The readers were developed with `tty.`; the launcher lists those first.
 - **Launcher: "Address already in use".** Another program has web port 5050 — start it with `--flask-port 5051`. (5000 is avoided on purpose: macOS uses it for AirPlay.)
+- **The Kinect / Hokuyo app dies at once with `ModuleNotFoundError`.** The launcher runs apps with *its own* Python. If an app needs packages that live in another environment, point that reader at it in `readers/setups.py`: `R("kinect/app.py", "Kinect app", port=False, server=True, python="../kinect/.venv/bin/python")`.
 - **A reader says "not found" in the launcher.** Run `python readers/launcher.py --check`, then fix the script name in `readers/setups.py`.
 - **A reader dies immediately from the launcher.** The status line shows the last line of its error; the complete output is in `<temp dir>/uniproto_launcher/<script>.log`.
 - **Plots lag or freeze on a slow machine.** Lower `!rate:`, and for the dual-motor reader watch the `draw` and `rx` numbers in its status line: rising `draw` means plotting is the bottleneck, rising `rx` means the serial data is not being consumed fast enough.

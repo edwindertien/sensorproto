@@ -26,11 +26,15 @@ GROUPS = [
 
 @dataclass(frozen=True)
 class Reader:
-    script: str            # file name in readers/ (or a path relative to it, e.g. ../lidar/scan.py)
+    script: str            # file in readers/, or a path from readers/ or from the repo root (kinect/app.py)
     label: str             # shown on the launcher button
     args: tuple = ()       # extra command-line arguments
     port: bool = True      # False = script does not take --port
     debug: bool = False    # raw probes etc.: hidden in the launcher unless "Show debug readers"
+    server: bool = False   # a long-running app (e.g. Flask) with no window of its own: the launcher
+                           # shows Stop + the address it prints, and opens that address
+    python: str = ""       # optional interpreter for this script (path relative to readers/, or absolute);
+                           # default = the Python that runs the launcher
 
 
 @dataclass(frozen=True)
@@ -115,12 +119,10 @@ SETUPS = [
           note="Firmware only: the Leonardo shows up as a USB-MIDI device "
                "(notes 36/38/42/46 on channel 10). Flash with: "
                "pio run -e piezo_midi -t upload"),
-    Setup("lidar", "Lidar", "2D laser scanner", "", "PC", 3,
-          (R("plot_lidar.py", "Lidar scan", port=False),),
-          note="Python-only. Adjust script name / port flag in setups.py if needed."),
+    Setup("lidar", "Lidar", "Hokuyo laser scanner", "", "PC", 3,
+          (R("hokuyo/app.py", "Hokuyo app", port=False, server=True),)),
     Setup("kinect", "Kinect", "depth camera", "", "PC", 3,
-          (R("plot_kinect.py", "Kinect view", port=False),),
-          note="Python-only. Adjust script name in setups.py if needed."),
+          (R("kinect/app.py", "Kinect app", port=False, server=True),)),
 ]
 
 # Scripts in readers/ that belong to no single setup. `launcher.py --check` lists every other

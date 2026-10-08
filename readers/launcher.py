@@ -17,8 +17,10 @@ What a click does:
   * Python-only readers (lidar, kinect) start without --port
   * the row under the grid lists every reader of the selected setup; "debug" readers
     (raw probes) stay hidden until you tick "Show debug readers"
-  * a reader's script may live outside readers/ (give a path relative to readers/
-    in setups.py); it is then started from its own folder
+  * a reader's script may live outside readers/ (a path from readers/ or from the repo
+    root, e.g. kinect/app.py); it is then started from its own folder
+  * "server" readers (kinect/app.py, hokuyo/app.py) have no window to close: the launcher
+    reads the web address they print, opens it, lists them under the grid and offers Stop
 
 Close reader windows with the window's × button (not Ctrl-C): the Leonardo needs the
 clean close to drop DTR, see docs/context.md.
@@ -31,6 +33,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -82,7 +85,13 @@ def valid_port(port: str) -> bool:
 
 
 def script_path(reader: Reader, readers_dir: Path = HERE) -> Path:
-    return (Path(readers_dir) / reader.script).resolve()
+    """readers/<script> if it exists, else <repo root>/<script> (so kinect/app.py works either way)."""
+    p = (Path(readers_dir) / reader.script).resolve()
+    if not p.is_file():
+        alt = (Path(readers_dir).parent / reader.script).resolve()
+        if alt.is_file():
+            return alt
+    return p
 
 
 def reader_available(reader: Reader, readers_dir: Path = HERE) -> bool:
@@ -97,10 +106,21 @@ def primary_reader(setup: Setup, readers_dir: Path = HERE):
 
 
 def build_command(reader: Reader, port: str, readers_dir: Path = HERE):
-    cmd = [sys.executable, str(script_path(reader, readers_dir))]
+    py = sys.executable
+    if reader.python:
+        py = str((Path(readers_dir) / reader.python).resolve()) if not Path(reader.python).is_absolute() \
+            else reader.python
+    cmd = [py, str(script_path(reader, readers_dir))]
     if reader.port and port:
         cmd += ["--port", port]
     return cmd + list(reader.args)
+
+
+def find_url(text: str) -> str:
+    """First web address in a program's output, preferring this computer's."""
+    urls = [u.rstrip(".,;)'\"") for u in re.findall(r"https?://[^\s'\"<>]+", text)]
+    local = [u for u in urls if re.match(r"https?://(127\.0\.0\.1|localhost|\[::1\])", u)]
+    return (local or urls or [""])[0]
 
 
 def last_log_line(path: Path) -> str:
@@ -158,6 +178,8 @@ class Proc:
     log_path: Path
     log_fh: object
     t0: float
+    url: str = ""
+    stopped: bool = False
 
 
 class Supervisor:
@@ -168,6 +190,7 @@ class Supervisor:
         self.procs: list[Proc] = []
         self.lock = threading.RLock()
         self.status = {"id": 0, "text": IDLE_HELP, "err": False, "log": None}
+        self.on_url = None            # called once with the address a server reader prints
 
     def say(self, text, err=False, log=None):
         with self.lock:
@@ -177,18 +200,62 @@ class Supervisor:
         return next((p for p in self.procs if p.reader.port), None)
 
     def poll(self):
-        """Reap finished readers and report them. Safe to call from anywhere."""
+        """Reap finished readers, report them, find the address of server readers."""
         with self.lock:
             for p in [p for p in self.procs if p.popen.poll() is not None]:
                 self.procs.remove(p)
                 p.log_fh.close()
                 rc = p.popen.returncode
-                if rc == 0:
+                if p.stopped:
+                    self.say(f"{p.reader.script} stopped.")
+                elif rc == 0:
                     self.say(f"{p.reader.script} closed.")
                 else:
                     tail = last_log_line(p.log_path)
                     self.say(f"{p.reader.script} exited with code {rc}: {tail}",
                              err=True, log=Path(p.reader.script).stem)
+            for p in self.procs:
+                if p.reader.server and not p.url and time.time() - p.t0 < 60:
+                    try:
+                        url = find_url(p.log_path.read_text(errors="replace"))
+                    except OSError:
+                        url = ""
+                    if url:
+                        p.url = url
+                        self.say(f"{p.reader.script} is serving {url}")
+                        if self.on_url:
+                            try:
+                                self.on_url(url)
+                            except Exception:
+                                pass
+
+    def stop(self, script: str):
+        """Stop a server reader (readers with a window are closed with their own × button)."""
+        with self.lock:
+            p = next((p for p in self.procs if p.reader.script == script and p.reader.server), None)
+            if p is None:
+                return False, "That reader is not a running server."
+            p.stopped = True
+            self._kill_tree(p.popen, signal.SIGTERM)
+            threading.Timer(3.0, lambda: self._kill_tree(p.popen, getattr(signal, "SIGKILL", signal.SIGTERM))).start()
+            return True, f"Stopping {script} …"
+
+    @staticmethod
+    def _kill_tree(popen, sig):
+        """Servers run in their own process group so a reloading Flask app dies with its child."""
+        if popen.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(popen.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                os.killpg(popen.pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                popen.terminate()
+            except OSError:
+                pass
 
     def launch(self, s: Setup, r: Reader, port: str):
         """Returns (ok, message); also updates self.status."""
@@ -218,9 +285,15 @@ class Supervisor:
             env = dict(os.environ, PYTHONUNBUFFERED="1")
             env["PYTHONPATH"] = os.pathsep.join(
                 [str(self.readers_dir)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+            kw = {}
+            if r.server:
+                if os.name == "nt":
+                    kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                else:
+                    kw["start_new_session"] = True
             try:
                 popen = subprocess.Popen(cmd, cwd=str(script_path(r, self.readers_dir).parent),
-                                         stdout=fh, stderr=subprocess.STDOUT, env=env)
+                                         stdout=fh, stderr=subprocess.STDOUT, env=env, **kw)
             except OSError as ex:
                 fh.close()
                 msg = f"could not start {r.script}: {ex}"
@@ -228,7 +301,7 @@ class Supervisor:
                 return False, msg
             self.procs.append(Proc(popen, s, r, port if r.port else "", log_path, fh, time.time()))
             msg = f"{r.script} started" + (f" on {port}" if r.port else "") + \
-                  ".  Close its window (×) when done."
+                  (".  Waiting for its web address …" if r.server else ".  Close its window (×) when done.")
             self.say(msg)
             return True, msg
 
@@ -272,6 +345,8 @@ button:hover{background:#dcdcd8}button:disabled{color:#999;cursor:default;backgr
 .legend i{display:inline-block;width:12px;height:12px;margin:0 4px -2px 0}
 .legend span{margin-right:14px}.legend label{float:right}
 #readers{margin-top:10px;min-height:30px;font-size:13px}#readers b{margin-right:6px}
+#running{margin-top:6px;font-size:13px}#running div{margin:3px 0}#running a{margin:0 8px}
+#running button{padding:2px 9px;margin-left:4px}
 #status{margin-top:8px;font-size:13px;min-height:36px;color:#333}#status.err{color:#B03A2E}
 #status a{margin-left:8px}
 """
@@ -326,6 +401,26 @@ JS = r"""
     });
   }
 
+  function renderRunning() {
+    var box = $('#running'); box.textContent = '';
+    (state.running || []).forEach(function (p) {
+      var row = document.createElement('div');
+      row.appendChild(document.createTextNode('● ' + p.label + (p.port ? ' on ' + p.port : '') + ' — running'));
+      if (p.url) {
+        var a = document.createElement('a'); a.href = p.url; a.target = '_blank'; a.textContent = 'open ' + p.url;
+        row.appendChild(a);
+      }
+      if (p.server) {
+        var b = document.createElement('button'); b.textContent = 'Stop';
+        b.addEventListener('click', function () {
+          api('/api/stop', {script: p.script}).then(function (res) { say(res.message, !res.ok); refresh(); });
+        });
+        row.appendChild(b);
+      }
+      box.appendChild(row);
+    });
+  }
+
   function paint() {
     state.setups.forEach(function (s) {
       var el = document.getElementById('card-' + s.id);
@@ -350,6 +445,7 @@ JS = r"""
       if (!hover) showCurrent();
     }
     renderReaders();
+    renderRunning();
   }
 
   function refresh() {
@@ -400,12 +496,13 @@ PAGE = """<!doctype html>
 <div class="legend">{% for name, color in groups %}<span><i style="background:{{ color }}"></i>{{ name }}</span>{% endfor %}
 <label><input type="checkbox" id="debug"> Show debug readers</label></div>
 <div id="readers"></div>
+<div id="running"></div>
 <div id="status">{{ idle }}</div>
 </div><script>{{ js|safe }}</script></body></html>
 """
 
 
-def create_app(readers_dir=HERE, icons_dir=ICONS, default_port="", strict_host=True):
+def create_app(readers_dir=HERE, icons_dir=ICONS, default_port="", strict_host=True, open_browser=False):
     try:
         from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file
     except ImportError:
@@ -415,6 +512,8 @@ def create_app(readers_dir=HERE, icons_dir=ICONS, default_port="", strict_host=T
     app = Flask(__name__)
     sup = Supervisor(readers_dir)
     app.sup = sup
+    if open_browser:
+        sup.on_url = webbrowser.open
     by_id = {s.id: s for s in SETUPS}
     cache = {"t": 0.0, "ports": []}
 
@@ -483,8 +582,9 @@ def create_app(readers_dir=HERE, icons_dir=ICONS, default_port="", strict_host=T
                     "group": s.group, "state": sup.setup_state(s), "note": s.note,
                     "readers": [{"script": r.script, "label": r.label, "debug": r.debug,
                                  "available": reader_available(r, readers_dir)} for r in s.readers]})
-            running = [{"script": p.reader.script, "port": p.port, "pid": p.popen.pid,
-                        "secs": int(time.time() - p.t0)} for p in sup.procs]
+            running = [{"script": p.reader.script, "label": p.reader.label, "port": p.port, "pid": p.popen.pid,
+                        "secs": int(time.time() - p.t0), "server": p.reader.server, "url": p.url}
+                       for p in sup.procs]
             status = dict(sup.status)
         return jsonify(ports=[{"device": d, "description": desc, "likely": lk} for d, desc, lk in pl],
                        setups=out, running=running, status=status)
@@ -523,6 +623,14 @@ def create_app(readers_dir=HERE, icons_dir=ICONS, default_port="", strict_host=T
             save_settings({"port": port})
         return jsonify(ok=ok, message=msg)
 
+    @app.post("/api/stop")
+    def api_stop():
+        data = request.get_json(silent=True) or {}
+        ok, msg = sup.stop(str(data.get("script") or ""))
+        if ok:
+            sup.say(msg)
+        return jsonify(ok=ok, message=msg)
+
     @app.get("/log/<stem>")
     def log(stem):
         stems = {Path(r.script).stem for s in SETUPS for r in s.readers}
@@ -558,7 +666,7 @@ def main():
     if not strict:
         print(f"WARNING: listening on {args.host} — anyone who can reach this address can start "
               f"readers on this computer.", flush=True)
-    app = create_app(default_port=args.port, strict_host=strict)
+    app = create_app(default_port=args.port, strict_host=strict, open_browser=not args.no_browser)
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '') else args.host}:{args.flask_port}"
     print(f"UniProto launcher: {url}   (Ctrl-C to stop; readers keep running)", flush=True)
     if not args.no_browser:
