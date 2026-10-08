@@ -11,7 +11,7 @@ change GRID_COLS), add its glyph in tools/make_icons.py, re-run the two tools.
 
 Run `python readers/launcher.py --check` to see which reader scripts exist.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 GRID_COLS = 6
 
@@ -59,8 +59,7 @@ SETUPS = [
     # ── row 1: motion & actuation ────────────────────────────────────────────
     Setup("bldc_gimbal", "BLDC gimbal", "FOC haptic knob", "bldc_gimbal", "Uno", 0,
           (R("plot_bldc_gimbal.py", "Gimbal control"),)),
-    Setup("bldc_servo", "BLDC servo", "ESC, 50 Hz PWM", "bldc_servo", "Uno", 0, (),
-          note="No Python reader yet. Talk to it with: pio device monitor -e bldc_servo"),
+    Setup("bldc_servo", "BLDC servo", "ESC, 50 Hz PWM", "bldc_servo", "Uno", 0, ()),
     Setup("dc_motor", "DC motor", "PID position / velocity", "dc_motor", "Uno", 0,
           (R("plot_dc_motor.py", "Motor monitor"),)),
     Setup("dual_motor", "Dual motor", "haptic master-slave", "haptic", "Uno", 0,
@@ -69,10 +68,8 @@ SETUPS = [
            R("plot_haptic_dual_motor_stream.py", "Stream plot"),
            R("plot_haptic_dual_motor_stream_vel.py", "Stream + velocity"),
            R("plot_haptic_dual_motor_debug.py", "Raw probe", debug=True))),
-    Setup("stepper", "Stepper", "MKS SERVO42D", "stepper", "Uno", 0, (),
-          note="No Python reader yet. Talk to it with: pio device monitor -e stepper"),
-    Setup("pneumatic", "Pneumatic", "pump + pressure", "pneumatic", "Uno", 0, (),
-          note="No Python reader yet. Talk to it with: pio device monitor -e pneumatic"),
+    Setup("stepper", "Stepper", "MKS SERVO42D", "stepper", "Uno", 0, ()),
+    Setup("pneumatic", "Pneumatic", "pump + pressure", "pneumatic", "Uno", 0, ()),
 
     # ── row 2: position & angle ──────────────────────────────────────────────
     Setup("lvdt", "LVDT", "AC position sensor", "lvdt", "Uno", 1,
@@ -87,8 +84,7 @@ SETUPS = [
           (R("plot_qtr8.py", "Reflectance array"),)),
     Setup("accelerometer", "Accelerometer", "MMA7260, 3 axes", "accelerometer", "Uno", 1,
           (R("plot_accelerometer.py", "Accelerometer"),)),
-    Setup("wiimote", "Wiimote IR", "IR camera via I2C", "wiimote", "Uno", 1, (),
-          note="No Python reader yet. Talk to it with: pio device monitor -e wiimote"),
+    Setup("wiimote", "Wiimote IR", "IR camera via I2C", "wiimote", "Uno", 1, ()),
 
     # ── row 3: force, touch & distance ───────────────────────────────────────
     Setup("load_cell", "Load cell", "HX711 amplifier", "load_cell", "Uno", 2,
@@ -134,6 +130,22 @@ NOT_SETUPS = {
     "setups.py": "the setup list",
     "uniproto_backend.py": "matplotlib backend picker",
 }
+
+# ── the generic dashboard (readers/dashboard.py) works with ANY UniProto sketch ──────────────
+# It becomes the click-through reader for setups that have no dedicated one, and an extra
+# "Generic dashboard" button on every other setup with a UniProto firmware.
+_NO_DASHBOARD = {"piezo_midi", "lidar", "kinect"}          # not UniProto devices
+_DASHBOARD_BAUD = {"lvdt": "38400"}                        # sketches that do not run at 115200
+
+
+def _with_dashboard(s: Setup) -> Setup:
+    if s.id in _NO_DASHBOARD or not s.env:
+        return s
+    args = ("--no-browser",) + (("--baud", _DASHBOARD_BAUD[s.id]) if s.id in _DASHBOARD_BAUD else ())
+    return replace(s, readers=s.readers + (R("dashboard.py", "Generic dashboard", args=args, server=True),))
+
+
+SETUPS = [_with_dashboard(s) for s in SETUPS]
 
 assert len(SETUPS) % GRID_COLS == 0, "grid is not rectangular"
 assert len({s.id for s in SETUPS}) == len(SETUPS), "duplicate setup id"
