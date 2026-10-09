@@ -44,8 +44,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent          # dashboard/
 ROOT = HERE.parent
+READERS = ROOT / "readers"                     # the per-setup plotters stay here
 sys.path.insert(0, str(HERE))
 from setups import SETUPS, GROUPS, GRID_COLS, NOT_SETUPS, Reader, Setup   # noqa: E402
 
@@ -79,12 +80,17 @@ def find_ports():
     return out
 
 
+def shown(script: str) -> str:
+    """How a reader's script is named in messages: 'dashboard/dashboard.py', not '../dashboard/dashboard.py'."""
+    return re.sub(r"^(\.\./)+", "", script)
+
+
 def valid_port(port: str) -> bool:
     """A port string goes into argv: no spaces, never looks like an option."""
     return bool(re.fullmatch(r"[A-Za-z0-9_./:@+\\-]{1,200}", port)) and not port.startswith("-")
 
 
-def script_path(reader: Reader, readers_dir: Path = HERE) -> Path:
+def script_path(reader: Reader, readers_dir: Path = READERS) -> Path:
     """readers/<script> if it exists, else <repo root>/<script> (so kinect/app.py works either way)."""
     p = (Path(readers_dir) / reader.script).resolve()
     if not p.is_file():
@@ -94,18 +100,18 @@ def script_path(reader: Reader, readers_dir: Path = HERE) -> Path:
     return p
 
 
-def reader_available(reader: Reader, readers_dir: Path = HERE) -> bool:
+def reader_available(reader: Reader, readers_dir: Path = READERS) -> bool:
     return script_path(reader, readers_dir).is_file()
 
 
-def primary_reader(setup: Setup, readers_dir: Path = HERE):
+def primary_reader(setup: Setup, readers_dir: Path = READERS):
     """What a click starts: the first available non-debug reader, else the first available."""
     avail = [r for r in setup.readers if reader_available(r, readers_dir)]
     normal = [r for r in avail if not r.debug]
     return (normal or avail or [None])[0]
 
 
-def build_command(reader: Reader, port: str, readers_dir: Path = HERE):
+def build_command(reader: Reader, port: str, readers_dir: Path = READERS):
     py = sys.executable
     if reader.python:
         py = str((Path(readers_dir) / reader.python).resolve()) if not Path(reader.python).is_absolute() \
@@ -145,7 +151,7 @@ def save_settings(d):
         pass
 
 
-def check_report(readers_dir: Path = HERE, icons_dir: Path = ICONS / "sm"):
+def check_report(readers_dir: Path = READERS, icons_dir: Path = ICONS / "sm"):
     """Text table: reader scripts / icons that exist, and scripts nobody registered.
     Returns (text, n_problems)."""
     lines, missing = [f"{'setup':16s} {'reader script':40s} status", "-" * 70], 0
@@ -207,12 +213,12 @@ class Supervisor:
                 p.log_fh.close()
                 rc = p.popen.returncode
                 if p.stopped:
-                    self.say(f"{p.reader.script} stopped.")
+                    self.say(f"{shown(p.reader.script)} stopped.")
                 elif rc == 0:
-                    self.say(f"{p.reader.script} closed.")
+                    self.say(f"{shown(p.reader.script)} closed.")
                 else:
                     tail = last_log_line(p.log_path)
-                    self.say(f"{p.reader.script} exited with code {rc}: {tail}",
+                    self.say(f"{shown(p.reader.script)} exited with code {rc}: {tail}",
                              err=True, log=Path(p.reader.script).stem)
             for p in self.procs:
                 if p.reader.server and not p.url and time.time() - p.t0 < 60:
@@ -222,7 +228,7 @@ class Supervisor:
                         url = ""
                     if url:
                         p.url = url
-                        self.say(f"{p.reader.script} is serving {url}")
+                        self.say(f"{shown(p.reader.script)} is serving {url}")
                         if self.on_url:
                             try:
                                 self.on_url(url)
@@ -262,7 +268,7 @@ class Supervisor:
         with self.lock:
             self.poll()
             if any(p.reader is r for p in self.procs):
-                msg = f"{r.script} is already running."
+                msg = f"{shown(r.script)} is already running."
                 self.say(msg)
                 return False, msg
             if r.port:
@@ -272,8 +278,8 @@ class Supervisor:
                     return False, msg
                 busy = self.port_holder()
                 if busy:
-                    msg = (f"{busy.reader.script} still holds {busy.port}. Close its window "
-                           f"(× button) before starting {r.script}.")
+                    msg = (f"{shown(busy.reader.script)} still holds {busy.port}. Close its window "
+                           f"(× button) before starting {shown(r.script)}.")
                     self.say(msg, err=True)
                     return False, msg
             cmd = build_command(r, port, self.readers_dir)
@@ -296,11 +302,11 @@ class Supervisor:
                                          stdout=fh, stderr=subprocess.STDOUT, env=env, **kw)
             except OSError as ex:
                 fh.close()
-                msg = f"could not start {r.script}: {ex}"
+                msg = f"could not start {shown(r.script)}: {ex}"
                 self.say(msg, err=True)
                 return False, msg
             self.procs.append(Proc(popen, s, r, port if r.port else "", log_path, fh, time.time()))
-            msg = f"{r.script} started" + (f" on {port}" if r.port else "") + \
+            msg = f"{shown(r.script)} started" + (f" on {port}" if r.port else "") + \
                   (".  Waiting for its web address …" if r.server else ".  Close its window (×) when done.")
             self.say(msg)
             return True, msg
@@ -382,7 +388,7 @@ JS = r"""
     return (showDebug || !normal.length) ? s.readers : normal;
   }
   function info(s) {
-    var names = visibleReaders(s).map(function (r) { return r.script; }).join(', ') || 'no reader';
+    var names = visibleReaders(s).map(function (r) { return r.script.replace(/^(\.\.\/)+/, ''); }).join(', ') || 'no reader';
     return s.title + ' — ' + s.tagline + '   |   board: ' + s.board + '   |   env: ' + (s.env || 'python only') +
            '   |   ' + names;
   }
@@ -502,7 +508,7 @@ PAGE = """<!doctype html>
 """
 
 
-def create_app(readers_dir=HERE, icons_dir=ICONS, default_port="", strict_host=True, open_browser=False):
+def create_app(readers_dir=READERS, icons_dir=ICONS, default_port="", strict_host=True, open_browser=False):
     try:
         from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file
     except ImportError:
@@ -608,14 +614,14 @@ def create_app(readers_dir=HERE, icons_dir=ICONS, default_port="", strict_host=T
             if r is None:
                 return jsonify(ok=False, message="unknown reader for this setup"), 400
             if not reader_available(r, readers_dir):
-                msg = f"{r.script} not found in {readers_dir}. Add the script or fix the name in readers/setups.py."
+                msg = f"{shown(r.script)} not found in {readers_dir}. Add the script or fix the name in dashboard/setups.py."
                 sup.say(msg, err=True)
                 return jsonify(ok=False, message=msg)
         else:
             r = primary_reader(s, readers_dir)
             if r is None:
-                msg = (f"{s.readers[0].script} not found in {readers_dir}. "
-                       f"Add the script or fix the name in readers/setups.py.")
+                msg = (f"{shown(s.readers[0].script)} not found in {readers_dir}. "
+                       f"Add the script or fix the name in dashboard/setups.py.")
                 sup.say(msg, err=True)
                 return jsonify(ok=False, message=msg)
         ok, msg = sup.launch(s, r, port)

@@ -9,7 +9,7 @@ UniProto dashboard — one web page for ANY UniProto sketch. Prototype.
   python dashboard.py --flask-port 5001 --no-browser     other web port, don't open a tab
   python dashboard.py --list-ports
 
-No hardware?   python tools/uniproto_sim.py     (prints a port to pass as --port)
+No hardware?   python dashboard/uniproto_sim.py     (prints a port to pass as --port)
 
 What it does
   * owns the serial port (Leonardo-safe: DTR low -> high on open, dropped again on close)
@@ -28,7 +28,7 @@ field (e.g. "pos,set,cmd,err,vel"); otherwise the fields are called f0, f1, ... 
 called "sid" (an explicit stream-id column) starts hidden.
 
 No external libraries (works offline): the charts are drawn on a plain canvas.
-Needs: flask, pyserial (readers/requirements.txt). Listens on this computer only unless you
+Needs: flask, pyserial (dashboard/requirements.txt). Listens on this computer only unless you
 pass --host; anyone who can reach it can drive the connected hardware.
 """
 import argparse

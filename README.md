@@ -57,13 +57,13 @@ Click an icon to jump to its section.
 same grid, has a serial-port box with suggestions, and starts the matching reader when you click an icon:
 
 ```bash
-python readers/launcher.py                 # opens http://127.0.0.1:5050
-python readers/launcher.py --check         # which reader scripts / icons exist?
-python readers/launcher.py --flask-port 5051 --no-browser     # other web port, don't open a tab
+python dashboard/launcher.py                 # opens http://127.0.0.1:5050
+python dashboard/launcher.py --check         # which reader scripts / icons exist?
+python dashboard/launcher.py --flask-port 5051 --no-browser     # other web port, don't open a tab
 ```
 
-It needs only `flask` and `pyserial` (both in `readers/requirements.txt`) — no tkinter. It listens on
-this computer only (`127.0.0.1`) and starts nothing that is not listed in `readers/setups.py`.
+It needs only `flask` and `pyserial` (both in `dashboard/requirements.txt`) — no tkinter. It listens on
+this computer only (`127.0.0.1`) and starts nothing that is not listed in `dashboard/setups.py`.
 The launcher starts each reader as its own process (a normal plot window) with `--port <port in the box>`. Only one reader
 can hold a serial port at a time, so a second one is refused until the first window is closed
 (use the window's **×** button — see [the Leonardo note](#troubleshooting)). Setups that have
@@ -76,33 +76,38 @@ The two PC-side apps, `kinect/app.py` and `hokuyo/app.py`, are started from thei
 ## Quick start
 
 ```bash
-# 1. firmware (PlatformIO) — one environment per setup
+# 1. firmware (PlatformIO) — one environment per setup; the sources are in src/<name>/
 pio run -e dc_motor -t upload
 pio device monitor -e dc_motor           # optional: talk to it by hand
 
-# 2. Python readers
+# 2a. the dashboard and the launcher — need only flask + pyserial
+pip install -r dashboard/requirements.txt
+python dashboard/launcher.py                            # click a setup ...
+python dashboard/dashboard.py --port /dev/tty.usbmodem21201    # ... or open the generic dashboard directly
+
+# 2b. the per-setup plotters (matplotlib, numpy, …)
 cd readers
 python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements.txt                        # a superset: includes what the dashboard needs
 python plot_dc_motor.py --port /dev/tty.usbmodem21201  # Windows: --port COM3
 ```
 
 Details for macOS / Windows / Linux, finding your port and Linux permissions: [`readers/SETUP.md`](readers/SETUP.md).
-Everything runs from the one virtual environment, including the launcher (Flask).
+`readers/requirements.txt` is a superset of `dashboard/requirements.txt`, so one virtual environment can run everything.
 
 <a name="dashboard"></a>
 ## The generic dashboard — any sketch, no plotter needed
 
-`readers/dashboard.py` is one web page that works with **any** UniProto sketch. It asks the board what it has
+`dashboard/dashboard.py` is one web page that works with **any** UniProto sketch. It asks the board what it has
 (`?`), then lets you chart a stream live, change parameters, press actions and record to CSV — so a new setup is
 usable the moment its firmware runs, before anyone has written a plotter.
 
 ![The generic dashboard showing a simulated servo: a setpoint step sent from the Parameters panel](docs/dashboard_demo.png)
 
 ```bash
-python readers/dashboard.py --port /dev/tty.usbmodem21201       # then open http://127.0.0.1:5000
-python readers/dashboard.py --port COM3 --stream 1 --rate 50    # ...and start streaming stream 1 at 50 Hz
-python tools/uniproto_sim.py                                     # no hardware? a simulated board (macOS / Linux)
+python dashboard/dashboard.py --port /dev/tty.usbmodem21201       # then open http://127.0.0.1:5000
+python dashboard/dashboard.py --port COM3 --stream 1 --rate 50    # ...and start streaming stream 1 at 50 Hz
+python dashboard/uniproto_sim.py                                     # no hardware? a simulated board (macOS / Linux)
 ```
 
 It also starts from the launcher: every setup has a **Generic dashboard** button, and the setups without a dedicated reader start it on click.
@@ -248,7 +253,7 @@ void setup() {
 void loop() { proto.tick(); }
 ```
 
-Then add a `[env:mysetup]` block (copy any existing one) and `src_mysetup/main.cpp`.
+Then add a `[env:mysetup]` block (copy any existing one) and `src/mysetup/main.cpp`.
 
 **Gotchas**
 
@@ -291,33 +296,35 @@ keep the `Button` objects in a list (otherwise they are garbage-collected and st
 ## Project layout
 
 ```
-platformio.ini            one [env] per setup (board, libraries, build flags)
-recordings/               CSV files written by the dashboard's Rec button (keep out of git)
-kinect/app.py  hokuyo/app.py     the two PC-side apps (no Arduino); started by the launcher
-lib/uniproto/             UniProto + UniWriter                    (the library)
+platformio.ini            one [env] per setup (board, libraries, build flags);  src_dir = src
+src/<setup>/main.cpp      the firmware: wiring + registerWith() calls   (one folder per setup)
+lib/uniproto/             UniProto + UniWriter                          (the library)
 lib/modules/              mod_*.h/.cpp — reusable hardware drivers (motors, ADNS-2610, HX711, …)
-src_<setup>/main.cpp      wiring + registerWith() calls          (one folder per setup)
-readers/
+dashboard/                the web side — launcher, generic dashboard, simulator
   setups.py               the list of setups: names, readers, groups   ← launcher, icons and README grid read this
   launcher.py             click-to-start launcher (Flask, opens in the browser)
   dashboard.py            generic web dashboard for ANY UniProto sketch (Flask)
-  plot_*.py               per-setup visualisers (the *_debug ones are raw probes)
+  uniproto_sim.py         a simulated UniProto board on a pseudo-terminal (macOS / Linux), for the dashboard
+  requirements.txt        flask + pyserial: all the dashboard needs
+readers/                  the per-setup plotters (matplotlib; one or more per setup)
+  plot_*.py               (the *_debug ones are raw probes)
   plot_adc_blocks.py      generic viewer for binary ADC-block streams (not tied to one setup)
   sensorhost/             browser host (Web Serial, Chrome/Edge): open index.html
   example.py              template for a new reader
   uniproto_backend.py     picks the matplotlib backend per OS
   requirements.txt  SETUP.md
+kinect/app.py  hokuyo/app.py     the two PC-side apps (no Arduino); started by the launcher
 tools/
-  make_icons.py           draws docs/icons/*.png from setups.py
+  make_icons.py           draws docs/icons/*.png from dashboard/setups.py
   update_readme_grid.py   rebuilds the grid above; --check reports README drift
-  uniproto_sim.py         a simulated UniProto board on a pseudo-terminal (macOS / Linux), for the dashboard
 docs/
   icons/                  128 px tiles (README) and sm/ 96 px tiles (launcher)
   context.md              technical decisions and debugging log
   bldc_gimbal.md          BLDC gimbal manual
+recordings/               CSV files written by the dashboard's Rec button (keep out of git)
 ```
 
-**Adding a setup:** add a `Setup(...)` entry to `readers/setups.py`, a glyph to `tools/make_icons.py`, and an
+**Adding a setup:** write `src/<name>/main.cpp` and an `[env:<name>]` block in `platformio.ini`; add a `Setup(...)` entry to `dashboard/setups.py`, a glyph to `tools/make_icons.py`, and an
 `<a id="…"></a>` section below; then run `python tools/make_icons.py` and `python tools/update_readme_grid.py`
 (`--check` tells you what is missing). To use a photo instead of a drawn icon, drop a PNG with the same file name into `docs/icons/` and `docs/icons/sm/`.
 
@@ -332,7 +339,7 @@ Status: ✅ documented · 🚧 stub (hardware listed, details to follow). bldc_s
 
 Field-oriented control of a gimbal motor as a programmable haptic knob: spring, detents, damper, or a sweep.
 **Hardware:** DRV8313 LittleFOC driver · AS5600 magnetic encoder · BDUA 2204 motor (7 pole pairs) · Uno.
-**Firmware:** `src_bldc_gimbal/` — a minimal FOC written for this repo (SimpleFOC does not fit the Uno's 32 KB). All three phases run at 62.5 kHz.
+**Firmware:** `src/bldc_gimbal/` — a minimal FOC written for this repo (SimpleFOC does not fit the Uno's 32 KB). All three phases run at 62.5 kHz.
 **Wiring:** pins 9, 10, 11 → DRV8313 IN1–IN3 · pin 8 → EN · A4/A5 → AS5600 SDA/SCL.
 **Reader:** `plot_bldc_gimbal.py` · full manual: [`docs/bldc_gimbal.md`](docs/bldc_gimbal.md)
 
@@ -353,7 +360,7 @@ If the spring pushes instead of pulls, swap two motor phase wires.
 <a id="bldc-servo"></a>
 ## BLDC servo — `bldc_servo` 🚧
 
-BLDC motor on a standard ESC, driven with 50 Hz servo PWM, no position feedback. Board: Uno. Firmware: `src_bldc_servo/`. **Reader:** the [generic dashboard](#dashboard).
+BLDC motor on a standard ESC, driven with 50 Hz servo PWM, no position feedback. Board: Uno. Firmware: `src/bldc_servo/`. **Reader:** the [generic dashboard](#dashboard).
 
 <a id="dc-motor"></a>
 ## DC motor — `dc_motor` ✅
@@ -383,7 +390,7 @@ setpoint pot on **A3 = GND, A4 = signal, A5 = VCC**. *Do not use A0/A1: the shie
 ## Dual motor (haptic) — `haptic` ✅
 
 Two coupled motors for master–slave haptics: move one and the other follows (and pushes back).
-**Hardware:** two Maxon motors with encoders · L293 driver · Uno. **Env:** `haptic` (firmware `src_haptic/`, driver `mod_motors`).
+**Hardware:** two Maxon motors with encoders · L293 driver · Uno. **Env:** `haptic` (firmware `src/haptic/`, driver `mod_motors`).
 **Stream 3:** `pos0, pos1, set0, set1, cmd0, cmd1, err0, err1`.
 **Commands:** `!stream:3`, `!motor0.enable:1`, `!motor0.kp:1.5`, `!motor0.set:500`, `!motor0.pwm:100`, `!motor0.pwm_lim:180`, `!motor.link:3` (bidirectional coupling), `!motor.link_scale:0.5`, `@motor.zero`, `@motor.stop`.
 **Readers:** `plot_haptic_dual_motor.py` — strip charts plus a command panel with presets ·
@@ -394,12 +401,12 @@ Two coupled motors for master–slave haptics: move one and the other follows (a
 <a id="stepper"></a>
 ## Stepper — `stepper` 🚧
 
-MKS SERVO42D closed-loop stepper controller driven with step/dir signals. Board: Uno. Firmware: `src_stepper/`. **Reader:** the [generic dashboard](#dashboard).
+MKS SERVO42D closed-loop stepper controller driven with step/dir signals. Board: Uno. Firmware: `src/stepper/`. **Reader:** the [generic dashboard](#dashboard).
 
 <a id="pneumatic"></a>
 ## Pneumatic — `pneumatic` 🚧
 
-Pump and valve with a Honeywell pressure sensor read through an HX711. Board: Uno. Firmware: `src_pneumatic/`. **Reader:** the [generic dashboard](#dashboard).
+Pump and valve with a Honeywell pressure sensor read through an HX711. Board: Uno. Firmware: `src/pneumatic/`. **Reader:** the [generic dashboard](#dashboard).
 
 <a id="lvdt"></a>
 ## LVDT — `lvdt` 🚧 *(waveform view still being verified)*
@@ -547,7 +554,7 @@ The same four pads, but the Leonardo appears as a **USB-MIDI device**: a hit sen
 | A2 | 42 | closed hi-hat |
 | A3 | 46 | open hi-hat |
 
-Remap by editing `NOTES[]` in `src_piezo_midi/main.cpp`. Library: MIDIUSB. Tune `THRESHOLD`, `PEAK_WINDOW` and `RETRIGGER` at the top of the sketch; use `piezo_serial` first to see what your pads actually deliver.
+Remap by editing `NOTES[]` in `src/piezo_midi/main.cpp`. Library: MIDIUSB. Tune `THRESHOLD`, `PEAK_WINDOW` and `RETRIGGER` at the top of the sketch; use `piezo_serial` first to see what your pads actually deliver.
 
 <a id="lidar"></a>
 ## Lidar (Hokuyo) — `lidar` 🚧
@@ -567,9 +574,9 @@ Depth camera. Python only (no Arduino firmware). **App:** `kinect/app.py`, start
 - **Leonardo / piezo reader hangs after the first run.** The Leonardo sketch waits (`while(!Serial)`) for DTR to rise. On macOS the OS can leave DTR high after a program ends, so the next run sees no edge. `plot_piezo_serial.py` opens the port with DTR low → high and drops DTR again on close — which happens reliably only when you close the window with its **×** button — Ctrl-C can interrupt before DTR is dropped. Always close with ×.
 - **macOS shows two ports per board** (`/dev/tty.usb…` and `/dev/cu.usb…`). The readers were developed with `tty.`; the launcher lists those first.
 - **Launcher: "Address already in use".** Another program has web port 5050 — start it with `--flask-port 5051`. (5000 is avoided on purpose: macOS uses it for AirPlay.)
-- **The Kinect / Hokuyo app dies at once with `ModuleNotFoundError`.** The launcher runs apps with *its own* Python. If an app needs packages that live in another environment, point that reader at it in `readers/setups.py`: `R("kinect/app.py", "Kinect app", port=False, server=True, python="../kinect/.venv/bin/python")`.
+- **The Kinect / Hokuyo app dies at once with `ModuleNotFoundError`.** The launcher runs apps with *its own* Python. If an app needs packages that live in another environment, point that reader at it in `dashboard/setups.py`: `R("kinect/app.py", "Kinect app", port=False, server=True, python="../kinect/.venv/bin/python")`.
 - **Dashboard: the page will not open, or answers "403 Forbidden / AirTunes" (macOS).** Open `http://127.0.0.1:5000` — not `localhost` — because macOS AirPlay Receiver can answer on port 5000 for `localhost`; or switch AirPlay Receiver off in System Settings, or use `--flask-port 5001`. Browsers also refuse some ports outright (5060 and 5061 among them), so avoid those.
 - **Dashboard: "the board did not answer '?'".** Wrong baud (`--baud`), a board that is not running a UniProto sketch, or a board still booting (it retries four times). **"could not open … busy"** means another program has the port — close other readers and serial monitors.
-- **A reader says "not found" in the launcher.** Run `python readers/launcher.py --check`, then fix the script name in `readers/setups.py`.
+- **A reader says "not found" in the launcher.** Run `python dashboard/launcher.py --check`, then fix the script name in `dashboard/setups.py`.
 - **A reader dies immediately from the launcher.** The status line shows the last line of its error; the complete output is in `<temp dir>/uniproto_launcher/<script>.log`.
 - **Plots lag or freeze on a slow machine.** Lower `!rate:`, and for the dual-motor reader watch the `draw` and `rx` numbers in its status line: rising `draw` means plotting is the bottleneck, rising `rx` means the serial data is not being consumed fast enough.

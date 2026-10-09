@@ -20,8 +20,6 @@ Safety
   * outside git it keeps platformio.ini.bak
   * platformio.ini is re-read afterwards: every [env] must select a folder that exists
   * documentation (*.md) is rewritten; mentions inside code (.py .cpp .h …) are only REPORTED
-  * submodules / nested repositories (e.g. kinect/libfreenect) are never touched or scanned, and
-    local changes inside them do not count as a dirty tree
   * running it twice is harmless ("already migrated")
 
 After --apply, copy in the updated Python files (dashboard/*.py, tools/*.py, README.md) and
@@ -67,17 +65,7 @@ class Git:
             return subprocess.CompletedProcess(args, 127, "", "git not installed")
 
     def clean(self):
-        """Clean = nothing to commit in THIS repository. Changes inside a submodule (e.g. a patched or
-        built libfreenect) are not ours to commit and are not touched by the restructure."""
-        return self.run("status", "--porcelain", "--ignore-submodules=dirty").stdout.strip() == ""
-
-    def submodules(self):
-        """[(path, has_local_changes)] for every submodule."""
-        out = self.run("ls-files", "--stage").stdout.splitlines()
-        paths = [l.split("\t", 1)[1] for l in out if l.startswith("160000")]
-        full = set(self.run("status", "--porcelain").stdout.splitlines())
-        dirty = full - set(self.run("status", "--porcelain", "--ignore-submodules=dirty").stdout.splitlines())
-        return [(p, any(l[3:].strip() == p for l in dirty)) for p in paths]
+        return self.run("status", "--porcelain").stdout.strip() == ""
 
     def tracked(self, rel):
         return bool(self.run("ls-files", "--", rel).stdout.strip())
@@ -89,9 +77,7 @@ class Git:
 def walk_files(root, suffixes):
     """Text files under root, skipping hidden folders, virtual environments and build output."""
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames
-                       if not d.startswith(".") and d not in {"node_modules", "__pycache__", "venv", "env"}
-                       and not (Path(dirpath) / d / ".git").exists()]       # a nested repo is somebody else's code
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in {"node_modules", "__pycache__", "venv", "env"}]
         for f in filenames:
             p = Path(dirpath) / f
             if p.suffix.lower() in suffixes:
@@ -232,9 +218,6 @@ def main():
 
     # ── plan ──
     print(f"Repository: {root}   ({'git' if git.ok else 'no git — will keep platformio.ini.bak'})")
-    if git.ok:
-        for path, dirty in git.submodules():
-            print(f"Submodule {path}: left alone" + (" (it has local changes — they stay exactly as they are)" if dirty else ""))
     print(f"\n1. Firmware folders → src/   ({len(movable)})")
     for p in movable:
         print(f"   {p.name}/  →  src/{p.name[4:]}/")

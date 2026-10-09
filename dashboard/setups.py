@@ -2,14 +2,14 @@
 setups.py — single source of truth for every UniProto setup.
 
 Read by:
-  readers/launcher.py          the click-to-start launcher
+  dashboard/launcher.py        the click-to-start launcher
   tools/make_icons.py          generates docs/icons/<id>.png
   tools/update_readme_grid.py  rebuilds the icon grid in README.md
 
 To add a setup: add one Setup(...) entry below (keep 24 for a 4x6 grid, or
 change GRID_COLS), add its glyph in tools/make_icons.py, re-run the two tools.
 
-Run `python readers/launcher.py --check` to see which reader scripts exist.
+Run `python dashboard/launcher.py --check` to see which reader scripts exist.
 """
 from dataclasses import dataclass, replace
 
@@ -131,7 +131,7 @@ NOT_SETUPS = {
     "uniproto_backend.py": "matplotlib backend picker",
 }
 
-# ── the generic dashboard (readers/dashboard.py) works with ANY UniProto sketch ──────────────
+# ── the generic dashboard (dashboard/dashboard.py) works with ANY UniProto sketch ──────────────
 # It becomes the click-through reader for setups that have no dedicated one, and an extra
 # "Generic dashboard" button on every other setup with a UniProto firmware.
 _NO_DASHBOARD = {"piezo_midi", "lidar", "kinect"}          # not UniProto devices
@@ -142,7 +142,7 @@ def _with_dashboard(s: Setup) -> Setup:
     if s.id in _NO_DASHBOARD or not s.env:
         return s
     args = ("--no-browser",) + (("--baud", _DASHBOARD_BAUD[s.id]) if s.id in _DASHBOARD_BAUD else ())
-    return replace(s, readers=s.readers + (R("dashboard.py", "Generic dashboard", args=args, server=True),))
+    return replace(s, readers=s.readers + (R("../dashboard/dashboard.py", "Generic dashboard", args=args, server=True),))
 
 
 SETUPS = [_with_dashboard(s) for s in SETUPS]

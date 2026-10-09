@@ -2,9 +2,9 @@
 """
 uniproto_sim.py — a simulated UniProto Arduino, for trying the dashboard without hardware.
 
-  python tools/uniproto_sim.py
+  python dashboard/uniproto_sim.py
       Simulated UniProto device 'SimLab' is listening on /dev/ttys005
-      Try it:   python readers/dashboard.py --port /dev/ttys005
+      Try it:   python dashboard/dashboard.py --port /dev/ttys005
 
 It creates a pseudo-terminal (macOS / Linux; not Windows) and answers exactly like the
 UniProto library does: the same command grammar (?  ?key  !key:value  @action), the same
@@ -300,7 +300,7 @@ def main():
     args = ap.parse_args()
     sim = SimDevice(args.name, args.drop_first_caps)
     print(f"Simulated UniProto device '{sim.name}' is listening on {sim.path}")
-    print(f"Try it:   python readers/dashboard.py --port {sim.path}")
+    print(f"Try it:   python dashboard/dashboard.py --port {sim.path}")
     print("(Ctrl-C to stop)", flush=True)
     try:
         sim.run()

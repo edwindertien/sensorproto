@@ -1,0 +1,11 @@
+# UniProto dashboard + launcher: the only dependencies.
+# Install with:  pip install -r dashboard/requirements.txt
+#
+# (The per-setup plotters in readers/ need more — matplotlib, numpy, pygame:
+#  pip install -r readers/requirements.txt  installs those AND these.)
+
+# Web server for the dashboard and the launcher
+flask>=3.0
+
+# Serial port access, and the launcher's port list
+pyserial>=3.5

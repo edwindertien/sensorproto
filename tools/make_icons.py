@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-make_icons.py — draw one pictogram tile per setup in readers/setups.py.
+make_icons.py — draw one pictogram tile per setup in dashboard/setups.py.
 
 Output (relative to the repo root):
   docs/icons/<id>.png       128 px   used by README.md
-  docs/icons/sm/<id>.png     96 px   used by readers/launcher.py
+  docs/icons/sm/<id>.png     96 px   used by dashboard/launcher.py
   docs/icons/_sheet.png      preview of the whole grid
 
 Only needs matplotlib + numpy. Re-run after changing setups.py or a glyph:
@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyBboxPatch, Polygon
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "readers"))
+sys.path.insert(0, str(ROOT / "dashboard"))
 from setups import SETUPS, GROUPS, GRID_COLS   # noqa: E402
 
 FIG_IN = 1.28                    # figure size in inches -> 128 px at dpi 100

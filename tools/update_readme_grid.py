@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-update_readme_grid.py — keep the README icon grid in sync with readers/setups.py.
+update_readme_grid.py — keep the README icon grid in sync with dashboard/setups.py.
 
   python tools/update_readme_grid.py           rewrite the grid in README.md
   python tools/update_readme_grid.py --check   report drift, change nothing
@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "readers"))
+sys.path.insert(0, str(ROOT / "dashboard"))
 from setups import SETUPS, GROUPS, GRID_COLS   # noqa: E402
 
 README = ROOT / "README.md"
