@@ -1,0 +1,46 @@
+{
+  "device": "SimLab",
+  "title": "SimLab — dashboard demo",
+
+  "streams": {
+    "2": { "fields": [ { "name": "V1", "label": "Voltage 1", "unit": "mV", "scale": 1000 },
+                       { "name": "V2", "label": "Voltage 2", "unit": "mV", "scale": 1000 },
+                       { "name": "temp", "label": "Temperature", "unit": "°C" } ] }
+  },
+
+  "views": [
+    { "name": "Servo", "stream": 1, "rate": 50, "window": 10, "widgets": [
+        { "type": "chart", "title": "Position vs setpoint", "fields": ["pos", "set"], "unit": "ticks" },
+        { "type": "chart", "title": "Drive", "fields": ["cmd"], "unit": "PWM", "min": -110, "max": 110 },
+        { "type": "value", "fields": ["pos", "err", "vel"] } ] },
+    { "name": "Environment", "stream": "env", "rate": 20, "window": 30, "widgets": [
+        { "type": "chart", "title": "Voltages", "fields": ["V1", "V2"] },
+        { "type": "chart", "title": "Temperature", "fields": ["Temperature"], "min": 20, "max": 23 } ] },
+    { "name": "Sensor array", "stream": "wave", "rate": 20, "widgets": [
+        { "type": "row", "title": "s0 … s7 (one value per sensor)", "min": 0, "max": 1023 } ] },
+    { "name": "Drum pads", "stream": 4, "rate": 100, "window": 5, "widgets": [
+        { "type": "chart", "title": "Four piezo pads" } ] },
+    { "name": "Capture frame", "stream": 6, "rate": 20, "widgets": [
+        { "type": "row", "title": "one capture, 48 samples", "skip": 3, "min": 0, "max": 255 } ] }
+  ],
+
+  "params": [
+    { "name": "mot.enable", "label": "Controller on", "group": "Servo" },
+    { "name": "mot.kp", "label": "Kp", "group": "Servo", "min": 0, "max": 10, "step": 0.1, "widget": "slider", "presets": [0.5, 2, 5] },
+    { "name": "mot.pwm_lim", "label": "Drive limit", "group": "Servo", "unit": "of 255", "min": 0, "max": 255, "step": 5, "widget": "slider" },
+    { "name": "mot.set", "label": "Setpoint", "group": "Servo", "unit": "ticks", "min": -3000, "max": 3000, "presets": [-1000, 0, 1000, 2000] },
+    { "name": "sim.gain", "label": "Signal gain", "group": "Environment", "min": 0, "max": 3, "step": 0.1, "widget": "slider" },
+    { "name": "sim.label", "label": "Label", "group": "Environment", "help": "A text parameter." }
+  ],
+
+  "actions": [
+    { "name": "mot.zero", "label": "Zero position" },
+    { "name": "sim.reset", "label": "Reset all parameters", "confirm": "Reset every parameter to its default?", "style": "danger" },
+    { "name": "sim.fail", "label": "Always fails (demo)" }
+  ],
+
+  "presets": [
+    { "label": "Gentle servo", "commands": ["!mot.kp:1", "!mot.pwm_lim:60"] },
+    { "label": "Step test (0 → 800 → 0)", "commands": ["!mot.set:0", { "wait": 1.0 }, "!mot.set:800", { "wait": 2.5 }, "!mot.set:0"] }
+  ]
+}

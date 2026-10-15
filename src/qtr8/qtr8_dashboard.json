@@ -1,0 +1,37 @@
+{
+  "device": "QTR8",
+  "title": "QTR-8 reflectance array",
+
+  "streams": {
+    "1": { "fields": [ { "name": "s0", "unit": "µs" }, { "name": "s1", "unit": "µs" }, { "name": "s2", "unit": "µs" }, { "name": "s3", "unit": "µs" },
+                       { "name": "s4", "unit": "µs" }, { "name": "s5", "unit": "µs" }, { "name": "s6", "unit": "µs" }, { "name": "s7", "unit": "µs" } ] },
+    "2": { "fields": ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7"] },
+    "3": { "fields": [ { "name": "pos", "label": "Line position" } ] },
+    "4": { "fields": [ { "name": "gray", "label": "Gray code" } ] }
+  },
+
+  "views": [
+    { "name": "Raw", "stream": 1, "rate": 20, "widgets": [
+        { "type": "row",   "title": "Decay time per sensor (long = dark)", "unit": "µs", "min": 0, "max": 2500 },
+        { "type": "chart", "title": "All sensors over time", "unit": "µs", "min": 0, "max": 2500 } ] },
+    { "name": "Binary", "stream": 2, "rate": 20, "widgets": [
+        { "type": "row", "title": "Black (1) / white (0) per sensor", "min": -0.1, "max": 1.1 } ] },
+    { "name": "Line position", "stream": 3, "rate": 20, "widgets": [
+        { "type": "chart", "title": "Line position (0 = left … 255 = right)", "fields": ["pos"], "min": 0, "max": 255 },
+        { "type": "value", "fields": ["pos"] } ] },
+    { "name": "Gray code", "stream": 4, "rate": 20, "widgets": [
+        { "type": "chart", "title": "Gray code (one bit changes per step)", "fields": ["gray"], "min": 0, "max": 255 },
+        { "type": "value", "fields": ["gray"] } ] }
+  ],
+
+  "params": [
+    { "name": "qtr.thr", "label": "Binary threshold", "unit": "µs", "min": 0, "max": 2500, "step": 50, "widget": "slider",
+      "presets": [500, 1000, 1500, 2000], "help": "A sensor counts as black above this decay time." },
+    { "name": "qtr.timeout", "label": "Full-black timeout", "unit": "µs", "min": 200, "max": 5000, "step": 100 }
+  ],
+
+  "actions": [
+    { "name": "qtr.cal", "label": "Calibrate threshold (50 samples)",
+      "confirm": "Point the sensor at the typical scene first. Calibrate now?" }
+  ]
+}

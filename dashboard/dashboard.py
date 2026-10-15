@@ -11,6 +11,14 @@ UniProto dashboard — one web page for ANY UniProto sketch. Prototype.
 
 No hardware?   python dashboard/uniproto_sim.py     (prints a port to pass as --port)
 
+Board configs (optional): a dashboard.json next to a sketch (src/<setup>/dashboard.json) or in
+dashboard/boards/ turns the generic page into a page for ONE board — tabs with chosen charts,
+named fields with units, sliders / menus / presets with enforced ranges, labelled buttons,
+command presets.  Found by the device name the board reports; edits apply within a second.
+The format is documented at the top of dashboard/boardconfig.py.
+  --config FILE      use this config file too (repeatable)      --config-dir DIR   search another folder
+  --no-config        ignore all board configs (the plain generic dashboard)
+
 What it does
   * owns the serial port (Leonardo-safe: DTR low -> high on open, dropped again on close)
   * asks the sketch what it has ('?'): streams, parameters, actions
@@ -49,7 +57,11 @@ from itertools import islice
 from pathlib import Path
 from urllib.parse import urlsplit
 
-ROOT = Path(__file__).resolve().parent.parent
+import boardconfig as BC
+from boardconfig import valid_command          # noqa: F401  (also used by the tests)
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 DEFAULT_WEB_PORT = 5000
 # Ports that browsers refuse to connect to (ERR_UNSAFE_PORT) — 5060/5061 are the SIP phone ports.
 UNSAFE_BROWSER_PORTS = {2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080}
@@ -120,10 +132,6 @@ def clean(x):
     return x if isinstance(x, (int, float)) and math.isfinite(x) else None
 
 
-def valid_command(line: str) -> bool:
-    return bool(line) and len(line) <= 63 and line[0] in "!?@" and not _CTRL.search(line)
-
-
 def valid_value(v: str) -> bool:
     return len(v) <= 40 and not _CTRL.search(v)
 
@@ -150,8 +158,9 @@ def list_ports():
 class Device:
     """Owns the serial port: a reader thread classifies every line, commands are serialised."""
 
-    def __init__(self, record_dir, boot_wait=2.0, caps_attempts=4):
+    def __init__(self, record_dir, boot_wait=2.0, caps_attempts=4, configs=None):
         self.record_dir = Path(record_dir)
+        self.configs = configs or BC.ConfigStore()      # board configs (dashboard.json); empty = generic mode
         self.boot_wait = boot_wait
         self.caps_attempts = caps_attempts     # tries at the '?' handshake (boards may still be booting)
         self.lock = threading.RLock()          # state + buffers (never held while waiting for a reply)
@@ -168,6 +177,11 @@ class Device:
         self.rows, self.seq, self.epoch = deque(maxlen=BUF_ROWS), 0, 0
         self.rate, self.ts_dev = None, False
         self.rec = {"fh": None, "wr": None, "path": "", "rows": 0}
+        self.cfg, self.cfg_path, self.cfg_warn, self.cfg_error, self.cfgv = None, "", [], "", 0
+        self.cfg_problems, self._cfg_stamp, self._cfg_checked = [], None, 0.0
+        self._preset_thread = None
+        self.param_refresh_s = 2.0             # re-read parameter values this often (0 = never)
+        self._gen, self._quiet = 0, False
         self.t0 = time.time()
         self.boot = int(self.t0 * 1000)        # identifies this server instance to open pages
 
@@ -177,7 +191,9 @@ class Device:
         self.units = ""
         self.fields, self.n_cols = [], None
         self._pending = []
-        self._switch = None                    # ("stream", id) / ("rate", n) awaiting the device's OK
+        self._scales = None                    # [(scale, offset)] per field, or None when all are 1/0
+        self.active_view, self.field_warn = None, []
+        self._switch = None                    # ("stream", id, view) / ("rate", n) awaiting the device's OK
         self.bad = 0
 
     def _log(self, mark, text):
@@ -185,46 +201,55 @@ class Device:
             self.cseq += 1
             self.console.append((self.cseq, f"{mark} {text}"))
 
-    def _write(self, cmd):
+    def _write(self, cmd, log=True):
         ser = self.ser
         if ser is None:
             raise OSError("not connected")
-        self._log(">", cmd)
+        if log:
+            self._log(">", cmd)
         ser.write((cmd + "\n").encode("ascii", "replace"))
         ser.flush()
 
-    def _xchg(self, cmd, want, timeout=1.5, key=None):
-        """Send cmd, wait for the matching reply. want: caps | ok | reply | any. -> (kind, payload) | None"""
+    def _xchg(self, cmd, want, timeout=1.5, key=None, quiet=False):
+        """Send cmd, wait for the matching reply. want: caps | ok | reply | any. -> (kind, payload) | None
+        quiet=True keeps the exchange out of the console (background refreshes)."""
         with self.cmd_lock:
-            while True:
-                try:
-                    self.replies.get_nowait()
-                except queue.Empty:
-                    break
+            self._quiet = quiet
             try:
-                self._write(cmd)
-            except (OSError, ValueError) as ex:
-                self._lost(str(ex))
+                return self._xchg_locked(cmd, want, timeout, key, quiet)
+            finally:
+                self._quiet = False
+
+    def _xchg_locked(self, cmd, want, timeout, key, quiet):
+        while True:
+            try:
+                self.replies.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self._write(cmd, log=not quiet)
+        except (OSError, ValueError) as ex:
+            self._lost(str(ex))
+            return None
+        end = time.time() + timeout
+        while True:
+            left = end - time.time()
+            if left <= 0:
                 return None
-            end = time.time() + timeout
-            while True:
-                left = end - time.time()
-                if left <= 0:
-                    return None
-                try:
-                    kind, payload = self.replies.get(timeout=left)
-                except queue.Empty:
-                    return None
-                if want == "any":
-                    return kind, payload
-                if want == "caps" and kind == "caps":
-                    return kind, payload
-                if want == "ok" and kind in ("ok", "err"):
-                    return kind, payload
-                if want == "reply" and kind == "err":
-                    return kind, payload
-                if want == "reply" and kind == "reply" and (key is None or payload[0] == key):
-                    return kind, payload
+            try:
+                kind, payload = self.replies.get(timeout=left)
+            except queue.Empty:
+                return None
+            if want == "any":
+                return kind, payload
+            if want == "caps" and kind == "caps":
+                return kind, payload
+            if want == "ok" and kind in ("ok", "err"):
+                return kind, payload
+            if want == "reply" and kind == "err":
+                return kind, payload
+            if want == "reply" and kind == "reply" and (key is None or payload[0] == key):
+                return kind, payload
 
     # -- reader thread --
     def _reader(self, ser):
@@ -256,23 +281,25 @@ class Device:
             return
         if kind == "text" and not payload:
             return
-        self._log("<", line)
+        if not (self._quiet and kind in ("ok", "err", "reply")):
+            self._log("<", line)
         if kind in ("ok", "err"):
             with self.lock:                    # apply a pending stream/rate change at the OK itself:
                 sw, self._switch = self._switch, None   # everything after it belongs to the new state
                 if sw and kind == "ok":
                     if sw[0] == "stream":
-                        self._apply_stream(sw[1])
+                        self._apply_stream(sw[1], sw[2] if len(sw) > 2 else None)
                     elif sw[0] == "rate":
                         self.rate = sw[1]
         if kind in ("ok", "err", "reply"):
             self.replies.put((kind, payload))
 
-    def _apply_stream(self, sid):
+    def _apply_stream(self, sid, view=None):
         """Called under self.lock, from the reader thread, right after the device's OK."""
         self.epoch += 1
         self.rows.clear()
         self._pending, self.n_cols, self.fields, self.bad = [], None, [], 0
+        self._scales, self.field_warn, self.active_view = None, [], (view if sid else None)
         self._close_record()
         if sid:
             s = next((x for x in (self.caps or {}).get("streams", []) if x.get("id") == sid), None)
@@ -295,7 +322,9 @@ class Device:
                         self._pending = []
                         return
                     self.n_cols = n
-                    self.fields = label_fields(self.units, k)
+                    self.fields, self.field_warn = BC.field_specs(self.cfg, self.stream, self.stream_name, k, self.units, label_fields)
+                    if any(f["scale"] != 1.0 or f["offset"] != 0.0 for f in self.fields):
+                        self._scales = [(f["scale"], f["offset"]) for f in self.fields]
                     for v in [v for v in self._pending if len(v) == n]:
                         self._store(v)
                     self._pending = []
@@ -312,6 +341,8 @@ class Device:
             t, v = vals[0], vals[1:]
         else:
             t, v = time.time() - self.t0, vals
+        if self._scales:
+            v = [x * sc + off for x, (sc, off) in zip(v, self._scales)]
         self.seq += 1
         self.rows.append((self.seq, t, v))
         if self.rec["wr"]:
@@ -404,12 +435,16 @@ class Device:
                 return
             self.caps, self.ts_dev, self.rate, self.params = caps, ts, board_rate, values
             self.cv += 1
+            self._load_config()
             self.state, self.error = "connected", ""
         self._log("*", f"connected to {caps.get('device', '?')} on {port}")
         if rate:
             self.set_rate(rate)
         if stream:
             self.set_stream(stream)
+        elif not rate and self.cfg and self.cfg["autostart"] and self.cfg["views"]:
+            self.set_view(self.cfg["views"][0]["name"])
+        self._start_param_loop()
 
     def _close_port(self):
         self._stop.set()
@@ -458,7 +493,7 @@ class Device:
             return "Not connected."
         return None
 
-    def set_stream(self, sid):
+    def set_stream(self, sid, view=None):
         err = self._need()
         if err:
             return False, err
@@ -467,13 +502,27 @@ class Device:
             if sid not in ids:
                 return False, f"Unknown stream {sid}."
         with self.lock:
-            self._switch = ("stream", sid or 0)
+            self._switch = ("stream", sid or 0, view)
         res = self._xchg(f"!stream:{sid or 0}", "ok")
         if not res or res[0] != "ok":
             with self.lock:
                 self._switch = None
             return False, f"The board refused: {res[1] if res else 'no answer'}"
         return True, "Streaming stopped." if not sid else f"Streaming stream {sid}."
+
+    def set_view(self, name):
+        """Switch to a tab of the board config: its stream (and rate), shown with its widgets."""
+        err = self._need()
+        if err:
+            return False, err
+        view = next((v for v in (self.cfg["views"] if self.cfg else []) if v["name"] == name), None)
+        if view is None:
+            return False, f"Unknown view {name!r}."
+        if view["rate"]:
+            ok, msg = self.set_rate(view["rate"])
+            if not ok:
+                return False, msg
+        return self.set_stream(view["stream"], view["name"])
 
     def set_rate(self, n):
         err = self._need()
@@ -497,6 +546,10 @@ class Device:
             return False, f"Unknown parameter {name!r}."
         if not valid_value(value):
             return False, "That value is not allowed."
+        spec = next((p for p in (self.cfg["params"] if self.cfg else []) if p["name"] == name), None)
+        bad = BC.check_param_value(spec, value)         # ranges / menus / read-only from the board config
+        if bad:
+            return False, bad
         res = self._xchg(f"!{name}:{value}", "ok")
         if not res:
             return False, "No answer from the board."
@@ -507,12 +560,12 @@ class Device:
             self.params[name] = r[1][1] if r and r[0] == "reply" else value
         return True, f"{name} = {self.params[name]}"
 
-    def refresh_params(self):
+    def refresh_params(self, quiet=False):
         err = self._need()
         if err:
             return False, err
         for name in list(self.params):
-            r = self._xchg(f"?{name}", "reply", key=name, timeout=0.8)
+            r = self._xchg(f"?{name}", "reply", key=name, timeout=0.8, quiet=quiet)
             with self.lock:
                 self.params[name] = r[1][1] if r and r[0] == "reply" else None
         return True, "Values refreshed."
@@ -528,7 +581,51 @@ class Device:
         res = self._xchg(f"@{name}" + (f":{args}" if args else ""), "ok")
         if not res:
             return False, "No answer from the board."
+        if res[0] == "ok":
+            self.refresh_params(quiet=True)             # the action may have changed parameters
         return res[0] == "ok", ("OK" if res[0] == "ok" else res[1])
+
+    def run_preset(self, index):
+        """Run a command preset of the board config in the background (so waits do not block the page)."""
+        err = self._need()
+        if err:
+            return False, err
+        presets = self.cfg["presets"] if self.cfg else []
+        if not (isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(presets)):
+            return False, "Unknown preset."
+        with self.lock:
+            if self._preset_thread is not None and self._preset_thread.is_alive():
+                return False, "Another preset is still running."
+            p = presets[index]
+            self._preset_thread = threading.Thread(target=self._preset_worker, args=(p,), daemon=True)
+            th = self._preset_thread
+        th.start()
+        return True, f"Running preset '{p['label']}' ({len(p['steps'])} steps)."
+
+    def _preset_worker(self, p):
+        for i, step in enumerate(p["steps"], 1):
+            if self.state != "connected":
+                self._log("*", f"preset '{p['label']}' stopped: not connected")
+                return
+            if "wait" in step:
+                time.sleep(step["wait"])
+                continue
+            cmd = step["cmd"]
+            kind, name, value = BC.parse_step(cmd)
+            try:
+                if kind == "set":
+                    ok, msg = self.set_rate(int(value)) if name == "rate" else self.set_param(name, value)
+                elif kind == "act":
+                    ok, msg = self.action(name, value)
+                else:
+                    ok, msg = self.command(cmd)
+            except ValueError:
+                ok, msg = False, "bad value"
+            self._log("*", f"preset '{p['label']}' step {i}: {cmd} → {'OK' if ok else 'FAILED: ' + msg}")
+            if not ok:
+                self._log("*", f"preset '{p['label']}' stopped")
+                return
+        self._log("*", f"preset '{p['label']}' done")
 
     def command(self, line):
         err = self._need()
@@ -536,12 +633,81 @@ class Device:
             return False, err
         if not valid_command(line):
             return False, "Commands start with ! ? or @ and are at most 63 characters."
+        kind, name, value = BC.parse_step(line)
+        if kind == "set":                              # the console is no way around the board config's ranges
+            spec = next((p for p in (self.cfg["params"] if self.cfg else []) if p["name"] == name), None)
+            bad = BC.check_param_value(spec, value)
+            if bad:
+                return False, bad
         res = self._xchg(line, "any", timeout=1.0)
         if res is None:
             return True, "(no reply)"
         kind, payload = res
         return kind != "err", (payload if isinstance(payload, str) else
                                (f"{payload[0]}:{payload[1]}" if kind == "reply" else "(capabilities)"))
+
+    def _start_param_loop(self):
+        if not self.param_refresh_s:
+            return
+        self._gen += 1
+        threading.Thread(target=self._param_loop, args=(self._gen,), daemon=True).start()
+
+    def _param_loop(self, gen):
+        """Keep the parameter panel honest: read every value again every few seconds, without console noise.
+        A value that does not answer in time keeps its last known value (no flicker)."""
+        while self._gen == gen:
+            iv = self.param_refresh_s
+            if not iv or self._stop.wait(iv):            # 0 = switched off; stop set = disconnecting
+                return
+            if self.state != "connected":
+                return
+            for name in list(self.params):
+                if self._gen != gen or self.state != "connected":
+                    return
+                r = self._xchg(f"?{name}", "reply", key=name, timeout=0.8, quiet=True)
+                if r and r[0] == "reply":
+                    with self.lock:
+                        self.params[name] = r[1][1]
+
+    # -- board config --
+    def _load_config(self):
+        """(Re)read this board's dashboard.json. Never raises: problems become notes shown in the page."""
+        dev = (self.caps or {}).get("device", "")
+        found = self.configs.find(dev) if dev else None
+        with self.lock:
+            self.cfg, self.cfg_warn, self.cfg_error = None, [], ""
+            self.cfg_path = found["path"] if found else ""
+            if found:
+                try:
+                    self.cfg, self.cfg_warn = BC.normalize(found["raw"], self.caps)
+                    if found["others"]:
+                        self.cfg_warn.append("also defined in " + ", ".join(found["others"]) + " — the first file is used")
+                except BC.ConfigError as ex:
+                    self.cfg_error = str(ex)
+            self.cfg_problems = self.configs.problems()
+            self._cfg_stamp = self.configs.stamp()
+            if self.active_view and not any(v["name"] == self.active_view for v in (self.cfg["views"] if self.cfg else [])):
+                self.active_view = None
+            self.cfgv += 1
+
+    def reload_config(self):
+        if self.state != "connected":
+            return False, "Not connected."
+        self._load_config()
+        n = len(self.cfg_warn) + len(self.cfg_problems)
+        return True, ("Board config reloaded" if self.cfg else "No board config found for this device") + (f" ({n} note(s))" if n else ".")
+
+    def _check_config_changed(self):
+        """Called by the page's poll: notice an edited / fixed / new config file within about a second."""
+        if self.state != "connected" or time.time() - self._cfg_checked < 1.0:
+            return
+        self._cfg_checked = time.time()
+        try:
+            if self.configs.stamp() != self._cfg_stamp:
+                self._load_config()
+                self._log("*", "board config changed on disk — reloaded")
+        except OSError:
+            pass
 
     # -- recording --
     def start_record(self):
@@ -586,6 +752,7 @@ class Device:
 
     # -- what the page polls --
     def snapshot(self, since, csince):
+        self._check_config_changed()
         with self.lock:
             rows, last_seq = [], since
             if self.rows:
@@ -597,13 +764,28 @@ class Device:
                     last_seq = first + start + len(rows) - 1
             console = [[n, t] for n, t in self.console if n > csince]
             streams = (self.caps or {}).get("streams", [])
+            cfg, view, vwarn = self.cfg, None, []
+            if cfg and self.active_view and self.fields:
+                v = next((x for x in cfg["views"] if x["name"] == self.active_view), None)
+                if v:
+                    ws, vwarn = BC.resolve_widgets(v, self.fields)
+                    view = {"name": v["name"], "window": v["window"], "widgets": ws}
+            notes = list(self.cfg_warn) + list(self.field_warn) + vwarn + [f"{os.path.relpath(p, ROOT) if str(p).startswith(str(ROOT)) else p}: {m}" for p, m in self.cfg_problems]
+            config = {"loaded": bool(cfg), "error": self.cfg_error, "notes": notes,
+                      "path": (os.path.relpath(self.cfg_path, ROOT) if self.cfg_path.startswith(str(ROOT)) else self.cfg_path),
+                      "title": cfg["title"] if cfg else "",
+                      "stream_picker": cfg["stream_picker"] if cfg else True,
+                      "views": [{"name": v["name"], "stream": v["stream"], "rate": v["rate"]} for v in cfg["views"]] if cfg else [],
+                      "presets": [{"label": p["label"]} for p in cfg["presets"]] if cfg else []}
             return {
                 "boot": self.boot,
                 "state": self.state, "error": self.error, "port": self.port, "baud": self.baud,
                 "device": (self.caps or {}).get("device", ""),
                 "cv": self.cv, "streams": streams,
                 "actions": (self.caps or {}).get("actions", []),
-                "params": [{"name": k, "value": v, "type": infer_param(k, v)} for k, v in self.params.items()],
+                "action_specs": BC.merge_actions(cfg, (self.caps or {}).get("actions", [])),
+                "params": BC.merge_params(cfg, self.params, infer_param),
+                "config": config, "cfgv": self.cfgv, "active_view": self.active_view, "view": view,
                 "stream": self.stream, "rate": self.rate, "ts": self.ts_dev,
                 "fields": self.fields, "epoch": self.epoch, "bad": self.bad,
                 "seq": last_seq, "rows": rows,
@@ -617,7 +799,7 @@ CSS = r"""
 *{box-sizing:border-box}
 body{margin:0;background:#F4F4F2;font:13px/1.4 -apple-system,Helvetica,Arial,sans-serif;color:#222}
 #wrap{width:1090px;margin:0 auto;padding:10px 12px 20px}
-#top{height:42px;border-bottom:1px solid #d8d8d4;margin-bottom:10px}
+#top{overflow:hidden;border-bottom:1px solid #d8d8d4;margin-bottom:10px;padding-bottom:6px}#devname{font-size:11px;margin:0 0 0 2px;clear:left}
 #top h1{display:inline-block;font-size:18px;margin:6px 14px 0 0;vertical-align:top}
 #pill{display:inline-block;margin-top:9px;padding:1px 9px;border-radius:10px;background:#999;color:#fff;font-size:12px}
 #pill.connected{background:#2EB872}#pill.connecting{background:#E0A030}#pill.error{background:#C0392B}
@@ -638,6 +820,20 @@ select,input[type=text],input[type=number]{font-size:12px;padding:3px 4px}
 #params table{width:100%;border-collapse:collapse}#params td{padding:2px 3px}#params td.n{width:130px;word-break:break-all}
 #params input[type=text],#params input[type=number]{width:100px}
 #acts button{margin:2px 4px 2px 0}
+#tabs{display:none;margin-bottom:6px}
+#tabs button.tab{margin:0 3px 0 0;padding:5px 15px;border-radius:5px 5px 0 0;background:#e3e3df;border:1px solid #c9c9c4;font-size:13px}
+#tabs button.tab.on{background:#fff;font-weight:bold;border-color:#8a8a85}
+.tiles{margin:4px 0}.tile{display:inline-block;min-width:118px;margin:4px 8px 4px 0;padding:6px 10px;border:1px solid #d8d8d4;background:#fafaf8}
+.tl{font-size:11px;color:#777}.tv{font-size:22px;font-weight:bold;color:#222}
+.grp{padding:8px 0 2px;font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#888;font-weight:bold}
+.unit{color:#888;font-size:11px}.ro{font-weight:bold}
+button.danger{background:#f6dcd8;border-color:#d9a39b;color:#8e2b20}
+button.mini{padding:1px 6px;font-size:11px;margin:2px 3px 0 0}
+.presets{margin-top:2px}
+.sv{display:inline-block;min-width:34px;margin-left:6px;font-weight:bold}
+#notes .warn{color:#8a5a00;margin:3px 0}#notes .err{color:#8E2B20;margin:3px 0;font-weight:bold}
+#presets button{margin:2px 4px 2px 0}
+input[type=range]{width:110px;vertical-align:middle}
 #console{height:150px;overflow:auto;margin:0;padding:5px 7px;background:#1f2328;color:#d6dbe0;font:11px/1.35 Menlo,Consolas,monospace;white-space:pre-wrap}
 #cmd{width:240px}.hint{color:#777;font-size:11px}
 """
@@ -749,33 +945,80 @@ JS = r"""
   }
   function buildActions() {
     var box = $('acts'); clear(box);
-    if (!S.actions.length) { box.appendChild(el('span', 'hint', 'This sketch has no actions.')); return; }
-    S.actions.forEach(function (a) {
-      var b = el('button', '', '@' + a);
+    var specs = (S.action_specs || []).filter(function (a) { return !a.hidden; });
+    if (!specs.length) { box.appendChild(el('span', 'hint', 'This sketch has no actions.')); return; }
+    var lastGroup = null;
+    specs.forEach(function (a) {
+      if (a.group && a.group !== lastGroup) { box.appendChild(el('div', 'grp', a.group)); lastGroup = a.group; }
+      var b = el('button', a.style === 'danger' ? 'danger' : '', a.label || ('@' + a.name));
+      b.title = '@' + a.name;
       b.addEventListener('click', function () {
-        api('/api/action', {name: a}, function (st, j) { log(j ? (j.ok ? '✓ ' : '✗ ') + j.message : 'request failed'); });
+        if (a.confirm && !window.confirm(a.confirm)) return;
+        api('/api/action', {name: a.name}, function (st, j) { log(j ? (j.ok ? '✓ ' : '✗ ') + j.message : 'request failed'); });
       });
       box.appendChild(b);
     });
   }
+  function paramKind(p) {
+    if (p.readonly) return 'readonly';
+    if (p.options) return 'select';
+    if (p.widget === 'slider' || p.widget === 'checkbox' || p.widget === 'number' || p.widget === 'text') return p.widget;
+    return p.type === 'bool' ? 'checkbox' : (p.type === 'text' ? 'text' : 'number');
+  }
+  function setInput(inp, kind, v) {
+    if (kind === 'checkbox') inp.checked = v === '1'; else inp.value = v;
+    if (kind === 'slider' && inp.nextSibling) inp.nextSibling.textContent = v;
+  }
   function buildParams() {
     var box = $('params'); clear(box);
-    if (!S.params.length) { box.appendChild(el('span', 'hint', 'This sketch has no parameters.')); return; }
+    var specs = S.params.filter(function (p) { return !p.hidden; });
+    if (!specs.length) { box.appendChild(el('span', 'hint', 'This sketch has no parameters.')); return; }
     var tbl = el('table'); box.appendChild(tbl);
-    S.params.forEach(function (p) {
-      var tr = el('tr'), td = el('td', 'n', p.name); tr.appendChild(td);
+    var lastGroup = null;
+    specs.forEach(function (p) {
+      if (p.group && p.group !== lastGroup) {
+        var gr = el('tr'), gd = el('td', 'grp', p.group); gd.colSpan = 2; gr.appendChild(gd); tbl.appendChild(gr); lastGroup = p.group;
+      }
+      var kind = paramKind(p), tr = el('tr'), td = el('td', 'n', p.label || p.name);
+      td.title = (p.help ? p.help + '\n' : '') + p.name;
+      if (p.unit) td.appendChild(el('span', 'unit', ' ' + p.unit));
+      tr.appendChild(td);
       var td2 = el('td'), inp, b;
-      if (p.type === 'bool') {
+      if (kind === 'readonly') {
+        inp = el('span', 'ro', '–');
+      } else if (kind === 'checkbox') {
         inp = el('input'); inp.type = 'checkbox';
         inp.addEventListener('change', function () { sendParam(p.name, inp.checked ? '1' : '0', inp); });
+      } else if (kind === 'select') {
+        inp = el('select'); var keys = Object.keys(p.options), ki;
+        for (ki = 0; ki < keys.length; ki++) { var op = el('option', '', p.options[keys[ki]]); op.value = keys[ki]; inp.appendChild(op); }
+        inp.addEventListener('change', function () { sendParam(p.name, inp.value, inp); });
+      } else if (kind === 'slider') {
+        inp = el('input'); inp.type = 'range'; inp.min = p.min; inp.max = p.max; inp.step = p.step || 'any';
+        var out = el('output', 'sv', '');
+        inp.addEventListener('input', function () { inp.setAttribute('data-dirty', '1'); out.textContent = inp.value; });
+        inp.addEventListener('change', function () { sendParam(p.name, inp.value, inp); });
+        td2.appendChild(inp); td2.appendChild(out);
       } else {
-        inp = el('input'); inp.type = p.type === 'text' ? 'text' : 'number'; if (p.type !== 'text') inp.step = 'any';
+        inp = el('input'); inp.type = kind === 'text' ? 'text' : 'number';
+        if (kind === 'number') { inp.step = p.step || 'any'; if (p.min !== null) inp.min = p.min; if (p.max !== null) inp.max = p.max; }
         inp.addEventListener('input', function () { inp.setAttribute('data-dirty', '1'); });
         inp.addEventListener('keydown', function (e) { if (e.keyCode === 13) sendParam(p.name, inp.value, inp); });
         b = el('button', '', 'Set'); b.addEventListener('click', function () { sendParam(p.name, inp.value, inp); });
       }
       inp.setAttribute('data-param', p.name);
-      td2.appendChild(inp); if (b) td2.appendChild(b); tr.appendChild(td2); tbl.appendChild(tr);
+      if (kind !== 'slider') td2.appendChild(inp);
+      if (b) td2.appendChild(b);
+      if (p.presets && p.presets.length && kind !== 'readonly') {
+        var pr = el('div', 'presets');
+        p.presets.forEach(function (v) {
+          var pb = el('button', 'mini', (p.options && p.options[v]) ? p.options[v] : v);
+          pb.addEventListener('click', function () { setInput(inp, kind, v); sendParam(p.name, v, inp); });
+          pr.appendChild(pb);
+        });
+        td2.appendChild(pr);
+      }
+      tr.appendChild(td2); tbl.appendChild(tr);
     });
   }
   function sendParam(name, value, inp) {
@@ -784,15 +1027,61 @@ JS = r"""
       log(j ? (j.ok ? '✓ ' : '✗ ') + j.message : 'request failed');
     });
   }
+  function ensureOption(sel, v) {
+    var i; for (i = 0; i < sel.options.length; i++) if (sel.options[i].value === v) return;
+    var o = el('option', '', v + ' (current)'); o.value = v; sel.appendChild(o);
+  }
   function updateParamValues() {
-    var inputs = document.querySelectorAll('#params [data-param]'), i;
-    for (i = 0; i < inputs.length; i++) {
-      var inp = inputs[i], name = inp.getAttribute('data-param'), p = null, k;
+    var els = document.querySelectorAll('#params [data-param]'), i;
+    for (i = 0; i < els.length; i++) {
+      var inp = els[i], name = inp.getAttribute('data-param'), p = null, k;
       for (k = 0; k < S.params.length; k++) if (S.params[k].name === name) p = S.params[k];
-      if (!p || document.activeElement === inp || inp.getAttribute('data-dirty') === '1') continue;
-      if (inp.type === 'checkbox') inp.checked = p.value === '1'; else inp.value = p.value === null ? '' : p.value;
+      if (!p) continue;
+      var val = p.value === null ? '' : p.value;
+      if (inp.tagName === 'SPAN') { inp.textContent = p.value === null ? '–' : p.value + (p.unit ? ' ' + p.unit : ''); continue; }
+      if (document.activeElement === inp || inp.getAttribute('data-dirty') === '1') continue;
+      if (inp.type === 'checkbox') inp.checked = p.value === '1';
+      else if (inp.tagName === 'SELECT') { ensureOption(inp, val); inp.value = val; }
+      else { inp.value = val; if (inp.type === 'range' && inp.nextSibling) inp.nextSibling.textContent = val; }
       if (p.value === null) inp.placeholder = 'unreadable';
     }
+  }
+
+  /* ---------- board config: tabs, presets, notes ---------- */
+  function renderTabs() {
+    var c = S.config || {}, box = $('tabs'); clear(box);
+    var vs = c.views || [];
+    box.style.display = vs.length ? 'block' : 'none';
+    vs.forEach(function (v) {
+      var t = el('button', 'tab', v.name); t.setAttribute('data-view', v.name);
+      t.addEventListener('click', function () { post('/api/view', {name: v.name}); });
+      box.appendChild(t);
+    });
+    $('grp-stream').style.display = c.stream_picker === false ? 'none' : 'inline-block';
+  }
+  function markTabs() {
+    var ts = document.querySelectorAll('#tabs button'), i;
+    for (i = 0; i < ts.length; i++) ts[i].className = 'tab' + (S.active_view && ts[i].getAttribute('data-view') === S.active_view ? ' on' : '');
+  }
+  function renderPresets() {
+    var c = S.config || {}, box = $('presetbox'), list = $('presets'); clear(list);
+    var ps = c.presets || [];
+    box.style.display = ps.length ? 'block' : 'none';
+    ps.forEach(function (p, i) {
+      var b = el('button', '', p.label); b.addEventListener('click', function () { post('/api/preset', {index: i}); }); list.appendChild(b);
+    });
+  }
+  var notesKey = '';
+  function renderNotes() {
+    var c = S.config || {}, notes = (c.notes || []).slice(), err = c.error ? [c.error] : [];
+    var key = JSON.stringify([err, notes]);
+    if (key === notesKey) return;
+    notesKey = key;
+    var n = notes.length + err.length, list = $('notes'); clear(list);
+    $('notesbox').style.display = n ? 'block' : 'none';
+    $('ncount').textContent = n ? '(' + n + ')' : '';
+    err.forEach(function (m) { list.appendChild(el('div', 'err', m)); });
+    notes.forEach(function (m) { list.appendChild(el('div', 'warn', m)); });
   }
 
   /* ---------- console ---------- */
@@ -809,12 +1098,15 @@ JS = r"""
   }
 
   /* ---------- fields, legend, chart canvases ---------- */
+  function fname(i) { var f = S.fields[i]; return f ? (f.label || f.name) : ''; }
+  function funit(i) { var f = S.fields[i]; return f && f.unit ? f.unit : ''; }
+  function hasW() { return !!(S && S.view && S.view.widgets); }
   function visibleIdx() { var out = [], i; for (i = 0; i < S.fields.length; i++) if (!hidden[i]) out.push(i); return out; }
 
   function buildFields() {
     var lg = $('legend'); clear(lg);
     S.fields.forEach(function (f, i) {
-      var d = el('div'), sw = el('span', 'sw'), cb = el('input'), name = el('span', '', f.name), val = el('span', 'val', '');
+      var d = el('div'), sw = el('span', 'sw'), cb = el('input'), name = el('span', '', fname(i)), val = el('span', 'val', '');
       sw.style.background = COLORS[i % COLORS.length];
       cb.type = 'checkbox'; cb.checked = !hidden[i]; cb.id = 'fld' + i;
       cb.addEventListener('change', function () { hidden[i] = !cb.checked; buildCharts(); draw(); });
@@ -822,22 +1114,48 @@ JS = r"""
     });
     if (!layoutTouched) { layout = (S.fields.length > 1 && S.fields.length <= 12) ? 'stack' : 'one'; $('layout').value = layout; }
     if (!viewTouched) { viewMode = S.fields.length > 12 ? 'row' : 'time'; $('view').value = viewMode; }
-    showSkip();
+    toolbarForView();
     buildCharts();
   }
-  function showSkip() { $('skipbox').style.display = viewMode === 'row' ? 'inline-block' : 'none'; }
+  function toolbarForView() {                       /* the layout / view / skip controls belong to the automatic view only */
+    var w = hasW();
+    $('grp-layout').style.display = w ? 'none' : 'inline-block';
+    $('grp-view').style.display = w ? 'none' : 'inline-block';
+    $('skipbox').style.display = (!w && viewMode === 'row') ? 'inline-block' : 'none';
+  }
+  function showSkip() { toolbarForView(); }
   function buildCharts() {
     var box = $('charts'); clear(box); charts = [];
+    if (hasW()) {
+      var ws = S.view.widgets, nChart = 0, seen = 0, i;
+      for (i = 0; i < ws.length; i++) if (ws[i].type === 'chart') nChart++;
+      var h = Math.max(100, Math.min(190, Math.floor(520 / Math.max(1, nChart))));
+      ws.forEach(function (w) {
+        if (w.type === 'value') {
+          var wrap = el('div', 'tiles'), tiles = [];
+          w.ids.forEach(function (id) {
+            var t = el('div', 'tile'), v = el('div', 'tv', '–'); t.appendChild(el('div', 'tl', fname(id))); t.appendChild(v); wrap.appendChild(t); tiles.push({id: id, v: v});
+          });
+          box.appendChild(wrap); charts.push({value: true, tiles: tiles});
+        } else if (w.type === 'row') {
+          charts.push({row: true, canvas: mkCanvas(box, 260), title: w.title, unit: w.unit, ymin: w.ymin, ymax: w.ymax, skip: w.skip});
+        } else {
+          seen++;
+          charts.push({ids: w.ids, canvas: mkCanvas(box, h + (seen === nChart ? 18 : 0)), title: w.title, unit: w.unit, ymin: w.ymin, ymax: w.ymax, last: seen === nChart});
+        }
+      });
+      return;
+    }
     if (viewMode === 'row' && S && S.fields.length) { charts.push({row: true, canvas: mkCanvas(box, 340), last: true}); return; }
-    var ids = visibleIdx(), n = ids.length, i;
+    var ids = visibleIdx(), n = ids.length, i2;
     if (!n) { box.appendChild(el('div', 'hint', S && S.stream ? 'Waiting for data …' : 'Pick a stream above to start.')); return; }
     var forced = layout === 'stack' && n > 24;      /* far too many canvases: fall back to one chart */
     if (layout === 'one' || forced) {
       if (forced) box.appendChild(el('div', 'hint', n + ' fields: too many for one chart each — showing all in one chart. Untick fields to focus.'));
       charts.push({ids: ids, canvas: mkCanvas(box, 330), last: true});
     } else {
-      var h = Math.max(70, Math.min(150, Math.floor(560 / n)));
-      for (i = 0; i < n; i++) charts.push({ids: [ids[i]], canvas: mkCanvas(box, h + (i === n - 1 ? 18 : 0)), last: i === n - 1});
+      var hh = Math.max(70, Math.min(150, Math.floor(560 / n)));
+      for (i2 = 0; i2 < n; i2++) charts.push({ids: [ids[i2]], canvas: mkCanvas(box, hh + (i2 === n - 1 ? 18 : 0)), last: i2 === n - 1});
     }
   }
   function mkCanvas(box, h) {
@@ -845,6 +1163,16 @@ JS = r"""
   }
 
   /* ---------- drawing ---------- */
+  /* y range: data (padded) unless the config fixes min and/or max */
+  UD.range = function (ymin, ymax, lo, hi) {
+    var fl = ymin !== undefined && ymin !== null, fh = ymax !== undefined && ymax !== null;
+    if (!isFinite(lo)) { lo = fl ? ymin : 0; hi = fh ? ymax : (fl ? ymin + 1 : 1); }
+    if (hi - lo < 1e-9) { lo -= 1; hi += 1; } else { var pad = (hi - lo) * 0.06; if (!fl) lo -= pad; if (!fh) hi += pad; }
+    if (fl) lo = ymin;
+    if (fh) hi = ymax;
+    if (hi - lo < 1e-9) hi = lo + 1;
+    return [lo, hi];
+  };
   function drawChart(ch) {
     var c = ch.canvas, ctx = c.getContext ? c.getContext('2d') : null;
     if (!ctx) return;
@@ -857,8 +1185,7 @@ JS = r"""
     var lo = Infinity, hi = -Infinity;
     for (k = 0; k < ch.ids.length; k++) { var Y = V[ch.ids[k]]; if (!Y) continue;
       for (i = i0; i < i1; i++) { var y = Y[i]; if (y === null || y === undefined) continue; if (y < lo) lo = y; if (y > hi) hi = y; } }
-    if (!isFinite(lo)) { lo = 0; hi = 1; }
-    if (hi - lo < 1e-9) { lo -= 1; hi += 1; } else { var pad = (hi - lo) * 0.06; lo -= pad; hi += pad; }
+    var rg = UD.range(ch.ymin, ch.ymax, lo, hi); lo = rg[0]; hi = rg[1];
     function X(t) { return L + (t - t0) / windowS * pw; }
     function Yp(v) { return Tp + (hi - v) / (hi - lo) * ph; }
     ctx.font = '10px Helvetica, Arial, sans-serif'; ctx.lineWidth = 1;
@@ -887,9 +1214,15 @@ JS = r"""
       ctx.stroke();
     }
     ctx.restore();
-    if (ch.ids.length === 1) {                      /* stacked: name in the corner */
-      ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillStyle = COLORS[ch.ids[0] % COLORS.length];
-      ctx.font = 'bold 11px Helvetica, Arial, sans-serif'; ctx.fillText(S.fields[ch.ids[0]].name, L + 6, Tp + 3);
+    /* header: the widget title (+unit), then the names of the plotted fields in their colours */
+    var lab = ch.title ? ch.title + (ch.unit ? '  [' + ch.unit + ']' : '') : '', tx = L + 6;
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.font = 'bold 11px Helvetica, Arial, sans-serif';
+    if (lab) { ctx.fillStyle = '#333'; ctx.fillText(lab, tx, Tp + 3); tx += ctx.measureText(lab).width + 14; }
+    if (ch.ids.length <= 8) {
+      for (k = 0; k < ch.ids.length && tx < w - 60; k++) {
+        var nm = fname(ch.ids[k]) + (!lab && funit(ch.ids[k]) ? ' [' + funit(ch.ids[k]) + ']' : '');
+        ctx.fillStyle = COLORS[ch.ids[k] % COLORS.length]; ctx.fillText(nm, tx, Tp + 3); tx += ctx.measureText(nm).width + 12;
+      }
     }
   }
   function drawRow(ch) {
@@ -900,14 +1233,14 @@ JS = r"""
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
     var end = paused ? frozenIdx : T.length - 1;
     if (end < 0 || !V.length) return;
-    var rows = UD.rowSlice(V, end, 9, skipN), m = rows[rows.length - 1].length, r, j, i;
+    var sk = (ch.skip !== undefined && ch.skip !== null) ? ch.skip : skipN;
+    var rows = UD.rowSlice(V, end, 9, sk), m = rows[rows.length - 1].length, r, j, i;
     if (m < 1) return;
     var L = 56, R = 10, Tp = 18, B = 22, pw = w - L - R, ph = h - Tp - B, lo = Infinity, hi = -Infinity;
     for (r = 0; r < rows.length; r++) for (j = 0; j < rows[r].length; j++) {
       var y = rows[r][j]; if (y === null) continue; if (y < lo) lo = y; if (y > hi) hi = y;
     }
-    if (!isFinite(lo)) { lo = 0; hi = 1; }
-    if (hi - lo < 1e-9) { lo -= 1; hi += 1; } else { var pad = (hi - lo) * 0.06; lo -= pad; hi += pad; }
+    var rg = UD.range(ch.ymin, ch.ymax, lo, hi); lo = rg[0]; hi = rg[1];
     function X(k) { return m === 1 ? L + pw / 2 : L + k / (m - 1) * pw; }
     function Yp(v) { return Tp + (hi - v) / (hi - lo) * ph; }
     ctx.font = '10px Helvetica, Arial, sans-serif'; ctx.lineWidth = 1;
@@ -920,8 +1253,8 @@ JS = r"""
     }
     ctx.strokeStyle = '#ccc'; ctx.strokeRect(L + 0.5, Tp + 0.5, pw, ph);
     ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillStyle = '#666';
-    var xt = UD.niceTicks(0, Math.max(1, m - 1), 8);
-    for (i = 0; i < xt.length; i++) if (xt[i] <= m - 1) ctx.fillText(String(xt[i] + skipN), X(xt[i]), Tp + ph + 4);
+    if (m <= 16) { for (i = 0; i < m; i++) ctx.fillText(fname(sk + i), X(i), Tp + ph + 4); }      /* few values: use the field names */
+    else { var xt = UD.niceTicks(0, Math.max(1, m - 1), 8); for (i = 0; i < xt.length; i++) if (xt[i] <= m - 1) ctx.fillText(String(xt[i] + sk), X(xt[i]), Tp + ph + 4); }
     ctx.save(); ctx.beginPath(); ctx.rect(L - 4, Tp - 4, pw + 8, ph + 8); ctx.clip();
     for (r = 0; r < rows.length; r++) {                       /* oldest first: faint ghosts, then the latest row on top */
       var latest = r === rows.length - 1, row = rows[r], pen = false;
@@ -939,24 +1272,46 @@ JS = r"""
     }
     ctx.restore();
     ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillStyle = '#2d7dd2'; ctx.font = 'bold 11px Helvetica, Arial, sans-serif';
-    ctx.fillText('latest row — fields ' + skipN + ' … ' + (skipN + m - 1) + '  (' + m + ' values, faint = previous rows)', L + 2, 2);
+    ctx.fillText(ch.title ? ch.title + (ch.unit ? '  [' + ch.unit + ']' : '') + '   (faint = previous rows)'
+                          : 'latest row — fields ' + sk + ' … ' + (sk + m - 1) + '  (' + m + ' values, faint = previous rows)', L + 2, 2);
   }
+  function lastOf(i) { var a = V[i]; return a && a.length ? a[a.length - 1] : null; }
   function draw() {
-    var i; for (i = 0; i < charts.length; i++) { if (charts[i].row) drawRow(charts[i]); else drawChart(charts[i]); }
+    var i, j;
+    for (i = 0; i < charts.length; i++) {
+      var ch = charts[i];
+      if (ch.value) {
+        for (j = 0; j < ch.tiles.length; j++) {
+          var id = ch.tiles[j].id;
+          ch.tiles[j].v.textContent = UD.fmt(lastOf(id)) + (funit(id) ? ' ' + funit(id) : '');
+        }
+      } else if (ch.row) drawRow(ch); else drawChart(ch);
+    }
     if (S && T.length) for (i = 0; i < S.fields.length; i++) {
-      var v = $('val' + i); if (v) v.textContent = UD.fmt(V[i] ? V[i][V[i].length - 1] : null);
+      var v = $('val' + i); if (v) v.textContent = UD.fmt(lastOf(i)) + (funit(i) ? ' ' + funit(i) : '');
     }
   }
 
   /* ---------- applying a poll ---------- */
+  var viewKey = '', uiKey = '';
+  function applyWindow(j) {                         /* a view may ask for its own time window */
+    if (!(j.view && j.view.window)) return;
+    windowS = j.view.window;
+    var sel = $('win'), v = String(windowS), has = false, i;
+    for (i = 0; i < sel.options.length; i++) if (sel.options[i].value === v) has = true;
+    if (!has) { var o = el('option', '', v + ' s'); o.value = v; sel.appendChild(o); }
+    sel.value = v;
+  }
   function apply(j) {
     if (j.boot !== bootId) {                       /* new server instance: start over */
-      bootId = j.boot; seq = 0; cseq = 0; cv = -1; epoch = -1; fieldsKey = ''; T = []; V = [];
+      bootId = j.boot; seq = 0; cseq = 0; cv = -1; uiKey = ''; viewKey = ''; notesKey = ''; epoch = -1; fieldsKey = ''; T = []; V = [];
       clear($('console'));
     }
     S = j;
+    var cfgTitle = (j.config && j.config.title) || '';
+    $('title').textContent = cfgTitle || 'UniProto dashboard'; document.title = cfgTitle || 'UniProto dashboard';
     $('pill').textContent = j.state; $('pill').className = j.state;
-    $('devname').textContent = j.device ? j.device + '  ·  ' + j.port : (j.port || '');
+    $('devname').textContent = j.device ? j.device + '  ·  ' + j.port + (j.config && j.config.path ? '  ·  ' + j.config.path : '') : (j.port || '');
     var connected = j.state === 'connected', connecting = j.state === 'connecting';
     $('connect').style.display = connected || connecting ? 'none' : '';
     $('disconnect').style.display = connected || connecting ? '' : 'none';
@@ -964,20 +1319,31 @@ JS = r"""
     banner(j.state === 'error' || (j.state === 'disconnected' && j.error) ? j.error : '');
     ['stream', 'rate', 'setrate', 'rec', 'refreshp', 'cmd', 'send'].forEach(function (id) { $(id).disabled = !connected; });
 
-    if (j.cv !== cv) { cv = j.cv; buildStreams(); buildActions(); buildParams(); }
-    updateParamValues();
+    var ui = j.cv + ':' + j.cfgv;
+    if (ui !== uiKey) { uiKey = ui; buildStreams(); buildActions(); buildParams(); renderTabs(); renderPresets(); }
+    if (ui === uiKey && S.params) {                /* console hint: commands this board really has */
+      $('cmd').placeholder = '!' + (S.params.length ? S.params[0].name : 'param') + ':value   ?rate   @' + (S.actions.length ? S.actions[0] : 'action');
+    }
+    var bs = document.querySelectorAll('#tabs button, #presets button, #acts button'), bi;
+    for (bi = 0; bi < bs.length; bi++) bs[bi].disabled = !connected;
+    renderNotes(); markTabs(); updateParamValues();
+
     if (j.epoch !== epoch) { epoch = j.epoch; T = []; V = []; lastT = null; fieldsKey = ''; }
     var key = j.fields.map(function (f) { return f.name; }).join('|');
-    if (key !== fieldsKey) {
-      fieldsKey = key; hidden = j.fields.map(function (f) { return !!f.hidden; });
-      V = j.fields.map(function () { return []; }); T = []; buildFields();
+    var vkey = (j.active_view || '') + '#' + JSON.stringify(j.view ? j.view.widgets : null) + '#' +
+               JSON.stringify(j.fields.map(function (f) { return [f.label, f.unit, f.hidden]; }));
+    if (key !== fieldsKey) {                       /* new stream: new data arrays */
+      fieldsKey = key; viewKey = vkey; hidden = j.fields.map(function (f) { return !!f.hidden; });
+      V = j.fields.map(function () { return []; }); T = []; applyWindow(j); buildFields();
+    } else if (vkey !== viewKey) {                 /* same stream, other widgets / labels (e.g. the config was edited): keep the data */
+      viewKey = vkey; applyWindow(j); buildFields();
     }
     var sel = $('stream'); var want = j.stream === null ? '' : String(j.stream);
     if (document.activeElement !== sel && sel.value !== want) sel.value = want;
     if (j.rate !== null && document.activeElement !== $('rate')) $('rate').value = j.rate;
     $('rec').textContent = j.rec.on ? '■ Stop (' + j.rec.rows + ')' : '● Rec';
     $('recinfo').textContent = j.rec.path ? j.rec.path.split(/[\\/]/).pop() : '';
-    $('status2').textContent = (j.stream !== null ? 'stream ' + j.stream + ' · ' + j.fields.length + ' fields · ' : '') +
+    $('status2').textContent = (j.stream !== null ? (j.active_view ? 'view “' + j.active_view + '” · ' : '') + 'stream ' + j.stream + ' · ' + j.fields.length + ' fields · ' : '') +
       (j.ts ? 'device timestamps' : 'PC timestamps') + (j.bad ? ' · ' + j.bad + ' malformed lines skipped' : '');
 
     var r, i, k;
@@ -1024,6 +1390,7 @@ JS = r"""
   });
   $('rec').addEventListener('click', function () { post('/api/record', {on: !(S && S.rec.on)}); });
   $('refreshp').addEventListener('click', function () { post('/api/params/refresh', {}); });
+  $('reloadcfg').addEventListener('click', function () { post('/api/config/reload', {}); });
   function sendCmd() { var v = $('cmd').value.trim(); if (!v) return; $('cmd').value = ''; post('/api/command', {line: v}); }
   $('send').addEventListener('click', sendCmd);
   $('cmd').addEventListener('keydown', function (e) { if (e.keyCode === 13) sendCmd(); });
@@ -1047,20 +1414,21 @@ JS = r"""
 PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>UniProto dashboard</title>
 <style>{{ css|safe }}</style></head><body><div id="wrap">
-<div id="top"><h1>UniProto dashboard</h1><span id="pill">disconnected</span>
- <span id="devname" class="hint" style="margin-left:10px"></span>
- <div id="conn"><input type="text" id="port" list="portlist" value="{{ port }}" placeholder="/dev/tty.usbmodem…  or  COM3"
+<div id="top"><div id="conn"><input type="text" id="port" list="portlist" value="{{ port }}" placeholder="/dev/tty.usbmodem…  or  COM3"
   autocomplete="off" spellcheck="false"><datalist id="portlist"></datalist>
-  <button id="connect">Connect</button><button id="disconnect" style="display:none">Disconnect</button></div></div>
+  <button id="connect">Connect</button><button id="disconnect" style="display:none">Disconnect</button></div>
+ <h1 id="title">UniProto dashboard</h1><span id="pill">disconnected</span>
+ <div id="devname" class="hint"></div></div>
 <div id="banner"></div>
 <div id="main">
- <div id="bar"><span class="g"><label>Stream</label><select id="stream" disabled><option value="">— no stream —</option></select></span>
+ <div id="tabs"></div>
+ <div id="bar"><span class="g" id="grp-stream"><label>Stream</label><select id="stream" disabled><option value="">— no stream —</option></select></span>
   <span class="g"><label>Rate</label><input type="number" id="rate" value="20" min="1" max="500" style="width:58px" disabled>
   <button id="setrate" disabled>Set</button></span>
   <span class="g"><label>Window</label><select id="win"><option value="2">2 s</option><option value="5">5 s</option>
    <option value="10" selected>10 s</option><option value="30">30 s</option><option value="60">60 s</option></select></span>
-  <span class="g"><label>Layout</label><select id="layout"><option value="stack">one chart per field</option><option value="one">all in one</option></select></span>
-  <span class="g"><label>View</label><select id="view"><option value="time">over time</option><option value="row">latest row</option></select></span>
+  <span class="g" id="grp-layout"><label>Layout</label><select id="layout"><option value="stack">one chart per field</option><option value="one">all in one</option></select></span>
+  <span class="g" id="grp-view"><label>View</label><select id="view"><option value="time">over time</option><option value="row">latest row</option></select></span>
   <span class="g" id="skipbox" style="display:none"><label>skip first</label><input type="number" id="skip" value="0" min="0" style="width:50px"></span>
   <span class="g"><button id="pause">Pause</button> <a href="/api/csv" download="uniproto_buffer.csv"><button>Save CSV</button></a>
   <button id="rec" disabled>● Rec</button><span id="recinfo" class="hint"></span></span></div>
@@ -1068,6 +1436,9 @@ PAGE = """<!doctype html>
  <div id="legend"></div><div id="status2" class="hint" style="margin-top:6px"></div>
 </div>
 <div id="side">
+ <div class="box" id="notesbox" style="display:none"><h2>Board config <span id="ncount"></span></h2><div class="in"><div id="notes"></div>
+  <div style="margin-top:6px"><button id="reloadcfg">Reload config</button></div></div></div>
+ <div class="box" id="presetbox" style="display:none"><h2>Presets</h2><div class="in" id="presets"></div></div>
  <div class="box"><h2>Parameters</h2><div class="in"><div id="params"><span class="hint">Not connected.</span></div>
   <div style="margin-top:6px"><button id="refreshp" disabled>Refresh values</button></div></div></div>
  <div class="box"><h2>Actions</h2><div class="in" id="acts"><span class="hint">Not connected.</span></div></div>
@@ -1080,14 +1451,14 @@ PAGE = """<!doctype html>
 """
 
 
-def create_app(device=None, strict_host=True, record_dir=ROOT / "recordings", port="", boot_wait=2.0):
+def create_app(device=None, strict_host=True, record_dir=ROOT / "recordings", port="", boot_wait=2.0, configs=None):
     try:
         from flask import Flask, Response, abort, jsonify, render_template_string, request
     except ImportError:
         sys.exit("Flask is not installed. Run:  pip install -r requirements.txt")
 
     app = Flask(__name__)
-    dev = device or Device(record_dir, boot_wait)
+    dev = device or Device(record_dir, boot_wait, configs=configs)
     app.dev = dev
 
     @app.before_request
@@ -1139,6 +1510,18 @@ def create_app(device=None, strict_host=True, record_dir=ROOT / "recordings", po
             return jsonify(ok=False, message="bad stream id"), 400
         return result(dev.set_stream(sid))
 
+    @app.post("/api/view")
+    def api_view():
+        return result(dev.set_view(str(body().get("name") or "")))
+
+    @app.post("/api/preset")
+    def api_preset():
+        return result(dev.run_preset(body().get("index")))
+
+    @app.post("/api/config/reload")
+    def api_config_reload():
+        return result(dev.reload_config())
+
     @app.post("/api/rate")
     def api_rate():
         try:
@@ -1186,6 +1569,9 @@ def main():
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--boot-wait", type=float, default=2.0, help="seconds to wait after opening the port")
     ap.add_argument("--record-dir", default=str(ROOT / "recordings"))
+    ap.add_argument("--config", action="append", default=[], metavar="FILE", help="a board config (dashboard.json); can be repeated")
+    ap.add_argument("--config-dir", action="append", default=[], metavar="DIR", help="an extra folder to search for board configs")
+    ap.add_argument("--no-config", action="store_true", help="ignore board configs (generic dashboard only)")
     ap.add_argument("--list-ports", action="store_true")
     args = ap.parse_args()
 
@@ -1201,7 +1587,9 @@ def main():
     if args.flask_port in UNSAFE_BROWSER_PORTS:
         print(f"WARNING: browsers refuse to open port {args.flask_port} (ERR_UNSAFE_PORT). "
               f"Use another one, e.g. --flask-port 5000.", flush=True)
-    dev = Device(args.record_dir, args.boot_wait)
+    store = BC.ConfigStore() if args.no_config else BC.ConfigStore(
+        roots=[ROOT / "src", HERE / "boards"] + [Path(d) for d in args.config_dir], files=[Path(f) for f in args.config])
+    dev = Device(args.record_dir, args.boot_wait, configs=store)
     app = create_app(dev, strict_host=strict, port=args.port)
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '') else args.host}:{args.flask_port}"
     print(f"UniProto dashboard: {url}   (Ctrl-C to stop)", flush=True)

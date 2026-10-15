@@ -2,7 +2,7 @@
 """
 uniproto_sim.py — a simulated UniProto Arduino, for trying the dashboard without hardware.
 
-  python dashboard/uniproto_sim.py
+  python dashboard/uniproto_sim.py [--board dc_motor|qtr8]
       Simulated UniProto device 'SimLab' is listening on /dev/ttys005
       Try it:   python dashboard/dashboard.py --port /dev/ttys005
 
@@ -52,6 +52,7 @@ class SimDevice:
         self._rand = random.Random(7)
         self._spike = [0.0] * 4
         self.closed = False
+        self.readonly, self.text_params = set(), {"sim.label"}
         self._init_params()
         self._init_streams()
 
@@ -142,6 +143,21 @@ class SimDevice:
         except OSError:
             self.closed = True
 
+    def get_param(self, key):
+        return self.p[key]
+
+    def set_param(self, key, value):
+        """True if accepted. Numbers only, except the text parameters; read-only ones refuse."""
+        if key in self.readonly:
+            return False
+        if key not in self.text_params:
+            try:
+                float(value)
+            except ValueError:
+                return False
+        self.p[key] = value
+        return True
+
     def set_rate(self, n):
         self.rate = max(1, min(500, n))
 
@@ -173,7 +189,7 @@ class SimDevice:
             if key == "stream":
                 return self._write("stream:" + (",".join(str(i) for i in self.active) if self.active else "0"))
             if key in self.p:
-                return self._write(f"{key}:{self.p[key]}")
+                return self._write(f"{key}:{self.get_param(key)}")
             return self._write("ERR no-such-param")
         if line[0] == "!":
             body = line[1:]
@@ -211,13 +227,7 @@ class SimDevice:
                     self.active = [] if n == 0 else ([n] if n in ids else [])
                 return self._write("OK")
             if key in self.p:
-                try:
-                    if key != "sim.label":
-                        float(value)
-                except ValueError:
-                    return self._write("ERR set-failed")
-                self.p[key] = value
-                return self._write("OK")
+                return self._write("OK" if self.set_param(key, value) else "ERR set-failed")
             return self._write("ERR no-such-param")
         if line[0] == "@":
             body = line[1:]
@@ -292,13 +302,130 @@ class SimDevice:
                 pass
 
 
+class DCMotorSim(SimDevice):
+    """Looks like src/dc_motor: stream pos,set,cmd,err,vel,mA; position / velocity PID; mot.* parameters."""
+
+    def __init__(self, name="DCMotor", drop_first_caps=False):
+        super().__init__(name, drop_first_caps)
+        self.readonly = {"mot.pos", "mot.vel"}
+        self.text_params = set()
+
+    def _init_params(self):
+        self.p = {"mot.enable": "1", "mot.mode": "1", "mot.kp": "2.0", "mot.ki": "0.0", "mot.kd": "0.0",
+                  "mot.pwm_lim": "100", "mot.set": "0.0", "mot.pot_scale": "12000", "mot.vel_scale": "20000",
+                  "mot.pos": "0", "mot.vel": "0", "mot.ctrl_hz": "500", "mot.vel_alpha": "0.5"}
+        self.defaults = dict(self.p)
+        self.pos = self.vel = self.cmd = self.integ = self.prev_err = self.mA = 0.0
+        self.coast = False
+
+    def _init_streams(self):
+        self.streams = [Stream(1, "mot", "i32,f32,i32,f32,f32,f32", "pos,set,cmd,err,vel,mA", self._emit_mot)]
+        self.actions = {"mot.zero": self._act_zero, "mot.brake": self._act_brake, "mot.coast": self._act_coast}
+
+    def get_param(self, key):
+        if key == "mot.pos":
+            return str(int(round(self.pos)))
+        if key == "mot.vel":
+            return f"{self.vel:.1f}"
+        return self.p[key]
+
+    def step(self, dt):
+        P = {k: float(v) for k, v in self.p.items() if k not in ("mot.pos", "mot.vel")}
+        lim, sp = P["mot.pwm_lim"], P["mot.set"]
+        if P["mot.enable"] == 0:
+            self.cmd = 0.0
+        elif P["mot.mode"] == 0:
+            self.cmd = max(-lim, min(lim, sp))
+        else:
+            err = (sp - self.pos) if P["mot.mode"] == 1 else (sp - self.vel)
+            self.integ = max(-lim, min(lim, self.integ + P["mot.ki"] * err * dt))
+            d = (err - self.prev_err) / dt if dt > 0 else 0.0
+            self.prev_err = err
+            self.cmd = max(-lim, min(lim, P["mot.kp"] * err + self.integ + P["mot.kd"] * d))
+        damping = 60.0 if self.coast is False and P["mot.enable"] == 0 else 6.0
+        self.vel += (30.0 * self.cmd - damping * self.vel) * dt
+        self.pos += self.vel * dt
+        self.mA = abs(self.cmd) * 3.2 + abs(self.vel) * 0.02
+
+    def _emit_mot(self):
+        sp = float(self.p["mot.set"])
+        err = sp - self.pos if float(self.p["mot.mode"]) == 1 else sp - self.vel
+        return [str(int(round(self.pos))), f"{sp:.1f}", str(int(round(self.cmd))), f"{err:.1f}",
+                f"{self.vel + self._rand.gauss(0, 1.5):.1f}", f"{self.mA + self._rand.gauss(0, 4):.1f}"]
+
+    def _act_zero(self):
+        self.pos = self.vel = self.integ = 0.0
+        self.p["mot.set"] = "0.0"
+        return True
+
+    def _act_brake(self):
+        self.p["mot.enable"], self.p["mot.set"], self.vel = "0", "0.0", 0.0
+        return True
+
+    def _act_coast(self):
+        self.p["mot.enable"], self.coast = "0", True
+        return True
+
+
+class QTR8Sim(SimDevice):
+    """Looks like src/qtr8: raw decay times, thresholded bits, line position and gray code."""
+
+    def __init__(self, name="QTR8", drop_first_caps=False):
+        super().__init__(name, drop_first_caps)
+        self.rate = 20
+
+    def step(self, dt):
+        pass                                  # no dynamics: the signals are computed from the clock
+
+    def _init_params(self):
+        self.p = {"qtr.thr": "1000", "qtr.timeout": "2500"}
+        self.defaults = dict(self.p)
+
+    def _init_streams(self):
+        self.streams = [
+            Stream(1, "raw", "u16,u16,u16,u16,u16,u16,u16,u16", "s0,s1,s2,s3,s4,s5,s6,s7", lambda: [str(v) for v in self._raw()]),
+            Stream(2, "bin", "u8,u8,u8,u8,u8,u8,u8,u8", "b0,b1,b2,b3,b4,b5,b6,b7", lambda: [str(b) for b in self._bits()]),
+            Stream(3, "line", "u16", "pos", lambda: [str(int(self._line()))]),
+            Stream(4, "gray", "u16", "gray", lambda: [str(self._gray())]),
+        ]
+        self.actions = {"qtr.cal": self._act_cal}
+
+    def _raw(self):
+        t, to = self._now(), float(self.p["qtr.timeout"])
+        x = 3.5 + 3.2 * math.sin(0.5 * t)                      # a dark line moving under the sensor
+        return [int(max(0, min(to, 120 + (to - 120) * math.exp(-((i - x) ** 2) / 1.6) + self._rand.gauss(0, 25)))) for i in range(8)]
+
+    def _bits(self):
+        thr = float(self.p["qtr.thr"])
+        return [1 if v > thr else 0 for v in self._raw()]
+
+    def _line(self):
+        raw = self._raw()
+        tot = sum(raw) or 1
+        return sum(i * v for i, v in enumerate(raw)) / tot * 255.0 / 7.0
+
+    def _gray(self):
+        b = int("".join(str(x) for x in self._bits()), 2)
+        return b ^ (b >> 1)
+
+    def _act_cal(self):
+        self.p["qtr.thr"] = "1150"
+        return True
+
+
+BOARDS = {"simlab": SimDevice, "dc_motor": DCMotorSim, "qtr8": QTR8Sim}
+
+
 def main():
     ap = argparse.ArgumentParser(description="simulated UniProto device on a pseudo-terminal")
-    ap.add_argument("--name", default="SimLab")
+    ap.add_argument("--board", choices=sorted(BOARDS), default="simlab",
+                    help="what to pretend to be: simlab (demo, default), dc_motor or qtr8 (same streams/parameters as the real sketches)")
+    ap.add_argument("--name", default=None, help="device name reported by '?' (default depends on --board)")
     ap.add_argument("--drop-first-caps", action="store_true",
                     help="ignore the first '?' (simulates a board that is still booting)")
     args = ap.parse_args()
-    sim = SimDevice(args.name, args.drop_first_caps)
+    cls = BOARDS[args.board]
+    sim = cls(args.name, args.drop_first_caps) if args.name else cls(drop_first_caps=args.drop_first_caps)
     print(f"Simulated UniProto device '{sim.name}' is listening on {sim.path}")
     print(f"Try it:   python dashboard/dashboard.py --port {sim.path}")
     print("(Ctrl-C to stop)", flush=True)

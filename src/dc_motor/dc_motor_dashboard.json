@@ -1,0 +1,65 @@
+{
+  "device": "DCMotor",
+  "title": "DC motor — position / velocity / PWM",
+
+  "streams": {
+    "1": { "fields": [
+      { "name": "pos", "label": "Position",  "unit": "ticks" },
+      { "name": "set", "label": "Setpoint",  "unit": "ticks" },
+      { "name": "cmd", "label": "PWM command", "unit": "PWM" },
+      { "name": "err", "label": "Error",     "unit": "ticks" },
+      { "name": "vel", "label": "Velocity",  "unit": "counts/s" },
+      { "name": "mA",  "label": "Current",   "unit": "mA" } ] }
+  },
+
+  "views": [
+    { "name": "Control", "stream": 1, "rate": 50, "window": 10, "widgets": [
+        { "type": "chart", "title": "Position",   "fields": ["pos", "set"] },
+        { "type": "chart", "title": "Velocity",   "fields": ["vel"] },
+        { "type": "chart", "title": "PWM command", "fields": ["cmd"], "min": -255, "max": 255 },
+        { "type": "chart", "title": "Motor current", "fields": ["mA"], "min": 0 } ] },
+    { "name": "Error", "stream": 1, "window": 10, "widgets": [
+        { "type": "chart", "title": "Position error", "fields": ["err"] },
+        { "type": "value", "fields": ["pos", "set", "err", "vel", "mA"] } ] }
+  ],
+
+  "params": [
+    { "name": "mot.enable",   "label": "Controller on", "group": "Mode" },
+    { "name": "mot.mode",     "label": "Mode", "group": "Mode",
+      "options": { "0": "direct PWM", "1": "position PID", "2": "velocity PID" } },
+
+    { "name": "mot.kp", "label": "Kp", "group": "PID", "min": 0, "max": 20, "step": 0.1, "widget": "slider", "presets": [0.5, 2, 5],
+      "help": "Position mode likes about 2; velocity mode about 0.5." },
+    { "name": "mot.ki", "label": "Ki", "group": "PID", "min": 0, "max": 5, "step": 0.05, "widget": "slider", "presets": [0, 0.1, 2] },
+    { "name": "mot.kd", "label": "Kd", "group": "PID", "min": 0, "max": 1, "step": 0.01, "widget": "slider", "presets": [0, 0.05] },
+
+    { "name": "mot.pwm_lim", "label": "PWM limit", "group": "Limits", "unit": "of 255", "min": 0, "max": 255, "step": 5, "widget": "slider",
+      "presets": [50, 100, 255], "help": "Start low (50) and raise it gradually." },
+
+    { "name": "mot.ctrl_hz", "label": "Control loop", "group": "Timing", "unit": "Hz", "min": 1, "max": 2000, "presets": [50, 500, 2000],
+      "help": "50 Hz shows what a slow loop does to the response." },
+    { "name": "mot.vel_alpha", "label": "Velocity filter α", "group": "Timing", "min": 0, "max": 1, "step": 0.05, "widget": "slider",
+      "help": "1 = no filter; smaller = smoother." },
+
+    { "name": "mot.set",       "label": "Setpoint", "group": "Setpoint", "help": "The potentiometer overwrites this every 50 ms." },
+    { "name": "mot.pot_scale", "label": "Pot range, position mode", "group": "Setpoint", "unit": "ticks",    "min": 0, "max": 120000 },
+    { "name": "mot.vel_scale", "label": "Pot range, velocity mode", "group": "Setpoint", "unit": "counts/s", "min": 0, "max": 50000 },
+
+    { "name": "mot.pos", "label": "Position",  "group": "Readouts", "unit": "ticks",    "readonly": true },
+    { "name": "mot.vel", "label": "Velocity",  "group": "Readouts", "unit": "counts/s", "readonly": true }
+  ],
+
+  "actions": [
+    { "name": "mot.zero",  "label": "Zero encoder" },
+    { "name": "mot.brake", "label": "Brake", "style": "danger" },
+    { "name": "mot.coast", "label": "Coast" }
+  ],
+
+  "presets": [
+    { "label": "Position control (Kp 2)", "commands": ["!mot.mode:1", "!mot.kp:2", "!mot.ki:0", "!mot.kd:0"] },
+    { "label": "Velocity control",        "commands": ["!mot.mode:2", "!mot.kp:0.5", "!mot.ki:2"] },
+    { "label": "Safe: limit PWM to 50",   "commands": ["!mot.pwm_lim:50"] },
+    { "label": "Slow loop (50 Hz)",       "commands": ["!mot.ctrl_hz:50"] },
+    { "label": "Normal loop (500 Hz)",    "commands": ["!mot.ctrl_hz:500"] }
+  ]
+}
