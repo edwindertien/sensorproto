@@ -1,0 +1,64 @@
+{
+  "device": "SensorShield",
+  "title": "Sensor shield",
+
+  "streams": {
+    "1": { "fields": [ { "name": "sid", "hidden": true },
+                       { "name": "A0", "label": "Potentiometer",   "unit": "counts" },
+                       { "name": "A1", "label": "External input J1", "unit": "counts" },
+                       { "name": "A2", "label": "Foil sensor",     "unit": "counts" },
+                       { "name": "A3", "label": "Strain gauge amp", "unit": "counts" },
+                       { "name": "A4", "label": "Hall A",          "unit": "counts" },
+                       { "name": "A5", "label": "Hall B",          "unit": "counts" } ] },
+    "2": { "fields": [ { "name": "sid", "hidden": true },
+                       { "name": "foil_g",   "label": "Foil (Flexiforce)", "unit": "g" },
+                       { "name": "strain_g", "label": "Strain gauge",      "unit": "g" } ] },
+    "3": { "fields": [ { "name": "sid", "hidden": true }, { "name": "deg", "label": "Hall angle", "unit": "°" } ] },
+    "4": { "fields": [ { "name": "sid", "hidden": true },
+                       { "name": "pos", "label": "Encoder position", "unit": "counts" },
+                       { "name": "vel", "label": "Encoder velocity", "unit": "counts/s" } ] },
+    "5": { "fields": [ { "name": "sid", "hidden": true },
+                       { "name": "A", "label": "Slider pad A" }, { "name": "B", "label": "Slider pad B" },
+                       { "name": "pos_mm", "label": "Slider position", "unit": "mm" } ] },
+    "6": { "fields": [ { "name": "sid", "hidden": true },
+                       { "name": "count", "label": "RC charge count" }, { "name": "ref_v", "label": "Reference", "unit": "V" } ] },
+    "7": { "fields": [ { "name": "sid", "hidden": true }, { "name": "cm", "label": "Distance", "unit": "cm" } ] },
+    "8": { "fields": [ { "name": "sid", "hidden": true },
+                       { "name": "pot", "label": "Potentiometer", "unit": "°", "scale": 0.4, "offset": 0 },
+                       { "name": "hall_deg", "label": "Hall angle", "unit": "°" } ] }
+  },
+
+  "views": [
+    { "name": "Analog inputs", "stream": 1, "window": 10, "widgets": [
+        { "type": "chart", "title": "A0 … A5, raw ADC counts", "unit": "counts" } ] },
+
+    { "name": "Force", "stream": 2, "window": 10, "widgets": [
+        { "type": "chart", "title": "Foil and strain gauge over time", "fields": ["foil_g", "strain_g"], "unit": "g" },
+        { "type": "xy", "title": "Foil against strain gauge (hysteresis)", "x": "strain_g", "y": "foil_g", "trail": 600 },
+        { "type": "value", "fields": ["foil_g", "strain_g"] } ] },
+
+    { "name": "Hall angle", "stream": 3, "window": 10, "widgets": [
+        { "type": "chart", "fields": ["deg"], "title": "Rotation angle" },
+        { "type": "value", "fields": ["deg"] } ] },
+
+    { "name": "Pot vs Hall", "stream": 8, "optional": true, "window": 10, "widgets": [
+        { "type": "xy", "title": "Potentiometer against Hall angle (a straight line when they turn together)", "x": "pot", "y": "hall_deg", "trail": 400 },
+        { "type": "chart", "title": "Both angles over time", "fields": ["pot", "hall_deg"], "unit": "°" } ] },
+
+    { "name": "Encoder", "stream": 4, "window": 10, "widgets": [
+        { "type": "chart", "title": "Position", "fields": ["pos"] },
+        { "type": "chart", "title": "Velocity", "fields": ["vel"] } ] },
+
+    { "name": "Capacitive slider", "stream": 5, "window": 10, "widgets": [
+        { "type": "chart", "title": "Pads", "fields": ["A", "B"] },
+        { "type": "value", "fields": ["pos_mm"] } ] },
+
+    { "name": "RC-ADC", "stream": 6, "window": 10, "widgets": [
+        { "type": "chart", "title": "Charge count", "fields": ["count"] },
+        { "type": "chart", "title": "Reference", "fields": ["ref_v"] } ] },
+
+    { "name": "Ultrasonic", "stream": 7, "window": 10, "widgets": [
+        { "type": "chart", "fields": ["cm"], "title": "Distance", "min": 0 },
+        { "type": "value", "fields": ["cm"] } ] }
+  ]
+}
