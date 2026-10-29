@@ -5,7 +5,9 @@ UniProto dashboard — one web page for ANY UniProto sketch. Prototype.
   python dashboard.py --port /dev/tty.usbmodem21201      connect, then open http://127.0.0.1:5000
   python dashboard.py                                    start, pick the port in the page
   python dashboard.py --port P --stream 1 --rate 50      ...and start streaming stream 1 at 50 Hz
-  http://127.0.0.1:5000/?layout=one&window=5             page options: layout=one|stack, window=2|5|10|30|60, view=time|row, skip=N
+  python dashboard.py --port P --stream 1 --with 3       two streams together (e.g. pot in 1 against Hall angle in 3)
+  http://127.0.0.1:5000/?layout=one&window=5             page options: layout=one|stack, window=2|5|10|30|60, view=time|row|xy, skip=N,
+                                                         x=<field> y=<field> trail=N   (for view=xy)
   python dashboard.py --flask-port 5001 --no-browser     other web port, don't open a tab
   python dashboard.py --list-ports
 
@@ -18,6 +20,8 @@ command presets.  Found by the device name the board reports; edits apply within
 The format is documented at the top of dashboard/boardconfig.py.
   --config FILE      use this config file too (repeatable)      --config-dir DIR   search another folder
   --no-config        ignore all board configs (the plain generic dashboard)
+  --make-config      print a starter dashboard.json for the connected board and exit
+                       (python dashboard/dashboard.py --port P --make-config > src/<setup>/dashboard.json)
 
 What it does
   * owns the serial port (Leonardo-safe: DTR low -> high on open, dropped again on close)
@@ -188,6 +192,7 @@ class Device:
     # -- internals --
     def _reset_stream_state(self):
         self.stream, self.stream_name = None, ""
+        self.stream2, self.pair = None, None   # a second stream shown together with the first (see _apply_pair)
         self.units = ""
         self.fields, self.n_cols = [], None
         self._pending = []
@@ -289,6 +294,10 @@ class Device:
                 if sw and kind == "ok":
                     if sw[0] == "stream":
                         self._apply_stream(sw[1], sw[2] if len(sw) > 2 else None)
+                    elif sw[0] == "pair1":             # first half of a combined switch: stop showing anything
+                        self._apply_stream(0)              # until the second stream has been added
+                    elif sw[0] == "pair2":
+                        self._apply_pair(sw[1], sw[2])
                     elif sw[0] == "rate":
                         self.rate = sw[1]
         if kind in ("ok", "err", "reply"):
@@ -301,6 +310,7 @@ class Device:
         self._pending, self.n_cols, self.fields, self.bad = [], None, [], 0
         self._scales, self.field_warn, self.active_view = None, [], (view if sid else None)
         self._close_record()
+        self.stream2, self.pair = None, None
         if sid:
             s = next((x for x in (self.caps or {}).get("streams", []) if x.get("id") == sid), None)
             self.stream, self.stream_name = sid, (s or {}).get("name", "")
@@ -308,10 +318,81 @@ class Device:
         else:
             self.stream, self.stream_name, self.units = None, "", ""
 
+    def _apply_pair(self, a, b):
+        """Two streams at once (both tagged, i.e. each row starts with its own stream id). Called under self.lock."""
+        self.epoch += 1
+        self.rows.clear()
+        self._pending, self.n_cols, self.fields, self.bad = [], None, [], 0
+        self._scales, self.field_warn, self.active_view = None, [], None
+        self._close_record()
+        streams = (self.caps or {}).get("streams", [])
+        info = {x.get("id"): x for x in streams}
+        order = [x.get("id") for x in streams]
+        self.stream, self.stream2 = a, b
+        self.stream_name = f"{info.get(a, {}).get('name', a)}+{info.get(b, {}).get('name', b)}"
+        self.units = ""
+        driver = a if order.index(a) > order.index(b) else b        # the board emits in registration order each tick
+        self.pair = {"a": a, "b": b, "driver": driver, "k": {}, "last": {}, "ready": False, "split": 0, "scales": {},
+                     "names": {a: info.get(a, {}).get("name", str(a)), b: info.get(b, {}).get("name", str(b))},
+                     "units": {a: info.get(a, {}).get("units", ""), b: info.get(b, {}).get("units", "")}}
+
+    def _pair_build(self):
+        """Both widths known: the combined field list = fields of A then fields of B (the id columns left out)."""
+        p = self.pair
+        merged, scales = [], {}
+        for sid in (p["a"], p["b"]):
+            specs, warn = BC.field_specs(self.cfg, sid, p["names"][sid], p["k"][sid], p["units"][sid], label_fields)
+            self.field_warn += warn
+            specs = specs[1:]
+            scales[sid] = [(f["scale"], f["offset"]) for f in specs]
+            for f in specs:
+                g = dict(f)
+                g["name"] = f"{p['names'][sid]}.{f['name']}"
+                g["label"] = f"{f['label']} ({p['names'][sid]})" if f["label"] else ""
+                merged.append(g)
+            if sid == p["a"]:
+                p["split"] = len(specs)
+        if merged:
+            self.fields, p["scales"], p["ready"] = merged, scales, True
+
+    def _on_pair_row(self, vals):
+        """Route each row by its own stream id, keep the latest row of each stream, and emit ONE combined row whenever
+        the later-registered stream reports (it follows the other within the same tick, so the two belong together)."""
+        p = self.pair
+        off = 1 if self.ts_dev else 0
+        if len(vals) < off + 2:
+            self.bad += 1
+            return
+        try:
+            sid = int(round(vals[off]))
+        except (ValueError, OverflowError):
+            self.bad += 1
+            return
+        if sid not in (p["a"], p["b"]):
+            self.bad += 1
+            return
+        k = len(vals) - off
+        if sid not in p["k"]:
+            p["k"][sid] = k
+            if len(p["k"]) == 2:
+                self._pair_build()
+        if p["k"][sid] != k:
+            self.bad += 1
+            return
+        p["last"][sid] = vals[off + 1:]
+        if sid == p["driver"] and p["ready"] and len(p["last"]) == 2:
+            row = []
+            for x in (p["a"], p["b"]):
+                row += [v * sc + o for v, (sc, o) in zip(p["last"][x], p["scales"][x])]
+            self._push(vals[0] if self.ts_dev else time.time() - self.t0, row)
+
     def _on_data(self, vals):
         with self.lock:
             if self.stream is None:
                 return                          # stray line (stream just stopped): ignore
+            if self.pair is not None:
+                self._on_pair_row(vals)
+                return
             if self.n_cols is None:
                 self._pending.append(vals)
                 last = self._pending[-3:]
@@ -343,6 +424,9 @@ class Device:
             t, v = time.time() - self.t0, vals
         if self._scales:
             v = [x * sc + off for x, (sc, off) in zip(v, self._scales)]
+        self._push(t, v)
+
+    def _push(self, t, v):
         self.seq += 1
         self.rows.append((self.seq, t, v))
         if self.rec["wr"]:
@@ -355,7 +439,7 @@ class Device:
                 self._close_record()
 
     # -- connection --
-    def connect(self, port, baud=115200, stream=None, rate=None):
+    def connect(self, port, baud=115200, stream=None, rate=None, also=None):
         with self.lock:
             if self.state in ("connecting", "connected"):
                 return False, "Already connected — disconnect first."
@@ -366,7 +450,7 @@ class Device:
             self._reset_stream_state()
             self.epoch += 1
             self.rows.clear()
-        threading.Thread(target=self._connect_worker, args=(port, baud, stream, rate), daemon=True).start()
+        threading.Thread(target=self._connect_worker, args=(port, baud, stream, rate, also), daemon=True).start()
         return True, "Connecting …"
 
     def _fail(self, msg):
@@ -374,7 +458,7 @@ class Device:
             self.state, self.error = "error", msg
         self._close_port()
 
-    def _connect_worker(self, port, baud, stream=None, rate=None):
+    def _connect_worker(self, port, baud, stream=None, rate=None, also=None):
         try:
             import serial
         except ImportError:
@@ -441,7 +525,7 @@ class Device:
         if rate:
             self.set_rate(rate)
         if stream:
-            self.set_stream(stream)
+            self.set_stream(stream, also=also)
         elif not rate and self.cfg and self.cfg["autostart"] and self.cfg["views"]:
             self.set_view(self.cfg["views"][0]["name"])
         self._start_param_loop()
@@ -493,14 +577,30 @@ class Device:
             return "Not connected."
         return None
 
-    def set_stream(self, sid, view=None):
+    def _tagged(self, sid):
+        """True if the stream's first field is 'sid': the sketch writes its own id into every row, so rows of
+        several streams running together can be told apart."""
+        st = next((x for x in (self.caps or {}).get("streams", []) if x.get("id") == sid), None)
+        names = [u.strip().lower() for u in ((st or {}).get("units") or "").split(",")]
+        return bool(st) and names[0] == "sid"
+
+    def set_stream(self, sid, view=None, also=None):
         err = self._need()
         if err:
             return False, err
-        if sid is not None:
-            ids = [s.get("id") for s in (self.caps or {}).get("streams", [])]
-            if sid not in ids:
-                return False, f"Unknown stream {sid}."
+        ids = [s.get("id") for s in (self.caps or {}).get("streams", [])]
+        if sid is not None and sid not in ids:
+            return False, f"Unknown stream {sid}."
+        if also is not None:
+            if sid is None or also == sid:
+                return False, "Pick two different streams to combine."
+            if also not in ids:
+                return False, f"Unknown stream {also}."
+            for x in (sid, also):
+                if not self._tagged(x):
+                    return False, (f"Stream {x} cannot be combined with another one: its rows do not start with a "
+                                   f"stream id ('sid'), so they could not be told apart.")
+            return self._set_pair(sid, also)
         with self.lock:
             self._switch = ("stream", sid or 0, view)
         res = self._xchg(f"!stream:{sid or 0}", "ok")
@@ -509,6 +609,24 @@ class Device:
                 self._switch = None
             return False, f"The board refused: {res[1] if res else 'no answer'}"
         return True, "Streaming stopped." if not sid else f"Streaming stream {sid}."
+
+    def _set_pair(self, a, b):
+        with self.lock:
+            self._switch = ("pair1", a, b)
+        res = self._xchg(f"!stream:{a}", "ok")
+        if not res or res[0] != "ok":
+            with self.lock:
+                self._switch = None
+            return False, f"The board refused: {res[1] if res else 'no answer'}"
+        with self.lock:
+            self._switch = ("pair2", a, b)
+        res = self._xchg(f"!stream:+{b}", "ok")
+        if not res or res[0] != "ok":
+            with self.lock:
+                self._switch = None
+            self._xchg("!stream:0", "ok")                  # never leave half a pair running
+            return False, f"The board could not add stream {b}: {res[1] if res else 'no answer'}"
+        return True, f"Streaming streams {a} + {b} together."
 
     def set_view(self, name):
         """Switch to a tab of the board config: its stream (and rate), shown with its widgets."""
@@ -786,7 +904,8 @@ class Device:
                 "action_specs": BC.merge_actions(cfg, (self.caps or {}).get("actions", [])),
                 "params": BC.merge_params(cfg, self.params, infer_param),
                 "config": config, "cfgv": self.cfgv, "active_view": self.active_view, "view": view,
-                "stream": self.stream, "rate": self.rate, "ts": self.ts_dev,
+                "stream": self.stream, "stream2": self.stream2, "pair_split": (self.pair or {}).get("split", 0),
+                "rate": self.rate, "ts": self.ts_dev,
                 "fields": self.fields, "epoch": self.epoch, "bad": self.bad,
                 "seq": last_seq, "rows": rows,
                 "console": console, "cseq": self.cseq,
@@ -834,6 +953,8 @@ button.mini{padding:1px 6px;font-size:11px;margin:2px 3px 0 0}
 #notes .warn{color:#8a5a00;margin:3px 0}#notes .err{color:#8E2B20;margin:3px 0;font-weight:bold}
 #presets button{margin:2px 4px 2px 0}
 input[type=range]{width:110px;vertical-align:middle}
+.xywrap{margin:3px 0 0 6px}
+#xybox select{max-width:150px}
 #console{height:150px;overflow:auto;margin:0;padding:5px 7px;background:#1f2328;color:#d6dbe0;font:11px/1.35 Menlo,Consolas,monospace;white-space:pre-wrap}
 #cmd{width:240px}.hint{color:#777;font-size:11px}
 """
@@ -911,6 +1032,7 @@ JS = r"""
   var S = null, T = [], V = [], seq = 0, epoch = -1, cseq = 0, cv = -1, fieldsKey = '', bootId = null;
   var hidden = [], paused = false, frozenT = 0, frozenIdx = 0, windowS = 10, layout = 'stack', layoutTouched = false;
   var viewMode = 'time', viewTouched = false, skipN = 0;
+  var genXY = {x: 0, y: 1, trail: 300, fromT: null}, xyChoice = {}, xyWant = null;   /* the automatic x-y view */
   var charts = [], lastT = null, bannerMsg = '';
 
   function api(path, body, cb) {
@@ -942,6 +1064,21 @@ JS = r"""
       var op = el('option', '', s.id + ' · ' + s.name); op.value = String(s.id);
       op.title = (s.units || '') + (s.schema ? '   [' + s.schema + ']' : ''); sel.appendChild(op);
     });
+    var s2 = $('stream2'), n2 = el('option', '', '— none —'); clear(s2); n2.value = ''; s2.appendChild(n2);
+    S.streams.forEach(function (s) {
+      if (!isTagged(s)) return;
+      var o2 = el('option', '', s.id + ' · ' + s.name); o2.value = String(s.id); s2.appendChild(o2);
+    });
+  }
+  function isTagged(s) { return String(s.units || '').split(',')[0].trim().toLowerCase() === 'sid'; }   /* rows start with their stream id */
+  function updateWith() {                            /* the 'with' selector: only for boards with two or more tagged streams */
+    var tg = [], prim = null, i;
+    for (i = 0; i < S.streams.length; i++) { if (isTagged(S.streams[i])) tg.push(S.streams[i]); if (S.streams[i].id === S.stream) prim = S.streams[i]; }
+    var show = tg.length >= 2 && prim !== null && isTagged(prim) && !hasW() && !(S.config && S.config.stream_picker === false);
+    $('grp-with').style.display = show ? 'inline-block' : 'none';
+    var sel = $('stream2'), want = S.stream2 ? String(S.stream2) : '';
+    for (i = 0; i < sel.options.length; i++) sel.options[i].disabled = sel.options[i].value !== '' && sel.options[i].value === String(S.stream);
+    if (document.activeElement !== sel && sel.value !== want) sel.value = want;
   }
   function buildActions() {
     var box = $('acts'); clear(box);
@@ -1103,6 +1240,38 @@ JS = r"""
   function hasW() { return !!(S && S.view && S.view.widgets); }
   function visibleIdx() { var out = [], i; for (i = 0; i < S.fields.length; i++) if (!hidden[i]) out.push(i); return out; }
 
+  function fieldByName(n) {                          /* a field given by name, label or number; -1 if none */
+    var i, k;
+    for (i = 0; i < S.fields.length; i++) if (S.fields[i].name === n || (S.fields[i].label && S.fields[i].label === n)) return i;
+    k = parseInt(n, 10); if (String(k) === String(n) && k >= 0 && k < S.fields.length) return k;
+    for (i = 0; i < S.fields.length; i++) if (S.fields[i].name.split('.').pop() === n) return i;   /* 'A0' finds 'analog.A0' */
+    return -1;
+  }
+  function xyKey() { return String(S.stream) + (S.stream2 ? '+' + S.stream2 : ''); }
+  function setupXY() {                               /* X / Y drop-downs for the current stream */
+    var xs = $('xsel'), ys = $('ysel'), key = xyKey(), x = -1, y = -1, v, i, rem = xyChoice[key];
+    clear(xs); clear(ys);
+    if (!S.fields.length) return;                    /* right after a stream switch the new fields are not known yet: keep the choices */
+    S.fields.forEach(function (f, i) {
+      var lab = fname(i) + (funit(i) ? ' [' + funit(i) + ']' : ''), o1 = el('option', '', lab), o2 = el('option', '', lab);
+      o1.value = String(i); o2.value = String(i); xs.appendChild(o1); ys.appendChild(o2);
+    });
+    if (xyWant) { if (xyWant.x) x = fieldByName(xyWant.x); if (xyWant.y) y = fieldByName(xyWant.y); if (x >= 0 && y >= 0) xyWant = null; }
+    if ((x < 0 || y < 0) && rem && rem.x < S.fields.length && rem.y < S.fields.length) { x = rem.x; y = rem.y; }
+    if ((x < 0 || y < 0) && S.stream2 && S.pair_split > 0 && S.pair_split < S.fields.length) {      /* two streams: first of each */
+      v = visibleIdx(); x = -1; y = -1;
+      for (i = 0; i < v.length; i++) { if (v[i] < S.pair_split && x < 0) x = v[i]; if (v[i] >= S.pair_split && y < 0) y = v[i]; }
+    }
+    if (x < 0 || y < 0) { v = visibleIdx(); x = v.length ? v[0] : 0; y = v.length > 1 ? v[1] : Math.min(1, S.fields.length - 1); }
+    genXY.x = x; genXY.y = y; genXY.fromT = null;
+    xs.value = String(x); ys.value = String(y);
+    if (x >= 0 && y >= 0) xyChoice[key] = {x: x, y: y};
+  }
+  function xyChanged() {
+    genXY.x = parseInt($('xsel').value, 10); genXY.y = parseInt($('ysel').value, 10); genXY.trail = parseInt($('trail').value, 10) || 300;
+    if (S) { xyChoice[xyKey()] = {x: genXY.x, y: genXY.y}; buildCharts(); draw(); }
+  }
+
   function buildFields() {
     var lg = $('legend'); clear(lg);
     S.fields.forEach(function (f, i) {
@@ -1113,15 +1282,17 @@ JS = r"""
       val.id = 'val' + i; d.appendChild(cb); d.appendChild(sw); d.appendChild(name); d.appendChild(val); lg.appendChild(d);
     });
     if (!layoutTouched) { layout = (S.fields.length > 1 && S.fields.length <= 12) ? 'stack' : 'one'; $('layout').value = layout; }
-    if (!viewTouched) { viewMode = S.fields.length > 12 ? 'row' : 'time'; $('view').value = viewMode; }
+    if (!viewTouched) { viewMode = S.stream2 ? 'xy' : (S.fields.length > 12 ? 'row' : 'time'); $('view').value = viewMode; }
+    setupXY();
     toolbarForView();
     buildCharts();
   }
   function toolbarForView() {                       /* the layout / view / skip controls belong to the automatic view only */
     var w = hasW();
-    $('grp-layout').style.display = w ? 'none' : 'inline-block';
+    $('grp-layout').style.display = (w || viewMode === 'xy') ? 'none' : 'inline-block';       /* one plot: no layout to choose */
     $('grp-view').style.display = w ? 'none' : 'inline-block';
     $('skipbox').style.display = (!w && viewMode === 'row') ? 'inline-block' : 'none';
+    $('xybox').style.display = (!w && viewMode === 'xy') ? 'inline-block' : 'none';
   }
   function showSkip() { toolbarForView(); }
   function buildCharts() {
@@ -1137,13 +1308,24 @@ JS = r"""
             var t = el('div', 'tile'), v = el('div', 'tv', '–'); t.appendChild(el('div', 'tl', fname(id))); t.appendChild(v); wrap.appendChild(t); tiles.push({id: id, v: v});
           });
           box.appendChild(wrap); charts.push({value: true, tiles: tiles});
+        } else if (w.type === 'xy') {
+          var xch = {xy: true, xid: w.xid, yid: w.yid, trail: w.trail, title: w.title, xmin: w.xmin, xmax: w.xmax, ymin: w.ymin, ymax: w.ymax, fromT: null};
+          var xwrap = el('div', 'xywrap'), xclr = el('button', 'mini', 'Clear trail');
+          xclr.addEventListener('click', function () { xch.fromT = T.length ? T[T.length - 1] : null; draw(); });
+          xwrap.appendChild(xclr); box.appendChild(xwrap);
+          xch.canvas = mkCanvas(box, 340); charts.push(xch);
         } else if (w.type === 'row') {
-          charts.push({row: true, canvas: mkCanvas(box, 260), title: w.title, unit: w.unit, ymin: w.ymin, ymax: w.ymax, skip: w.skip});
+          charts.push({row: true, canvas: mkCanvas(box, 260), title: w.title, unit: w.unit, ymin: w.ymin, ymax: w.ymax, skip: w.skip, binary: w.binary});
         } else {
           seen++;
-          charts.push({ids: w.ids, canvas: mkCanvas(box, h + (seen === nChart ? 18 : 0)), title: w.title, unit: w.unit, ymin: w.ymin, ymax: w.ymax, last: seen === nChart});
+          charts.push({ids: w.ids, canvas: mkCanvas(box, h + (seen === nChart ? 18 : 0)), title: w.title, unit: w.unit, ymin: w.ymin, ymax: w.ymax, binary: w.binary, last: seen === nChart});
         }
       });
+      return;
+    }
+    if (viewMode === 'xy' && S && S.fields.length) {
+      if (S.fields.length < 2) { box.appendChild(el('div', 'hint', 'An x–y plot needs a stream with at least two fields — pick another stream above.')); return; }
+      charts.push({xy: true, canvas: mkCanvas(box, 440), xid: genXY.x, yid: genXY.y, trail: genXY.trail, title: '', xmin: null, xmax: null, ymin: null, ymax: null, fromT: genXY.fromT});
       return;
     }
     if (viewMode === 'row' && S && S.fields.length) { charts.push({row: true, canvas: mkCanvas(box, 340), last: true}); return; }
@@ -1163,16 +1345,22 @@ JS = r"""
   }
 
   /* ---------- drawing ---------- */
-  /* y range: data (padded) unless the config fixes min and/or max */
-  UD.range = function (ymin, ymax, lo, hi) {
+  /* y range: data (padded) unless the config fixes min and/or max.
+     binary = 0/1 signals: a steady -0.05 ... 1.05, so a moment of all zeros never rescales the axis.
+     A flat line otherwise: zero gets -1 ... 1, any other value +-10 %. */
+  UD.range = function (ymin, ymax, lo, hi, binary) {
     var fl = ymin !== undefined && ymin !== null, fh = ymax !== undefined && ymax !== null;
+    if (binary) return [fl ? ymin : -0.05, fh ? ymax : 1.05];
     if (!isFinite(lo)) { lo = fl ? ymin : 0; hi = fh ? ymax : (fl ? ymin + 1 : 1); }
-    if (hi - lo < 1e-9) { lo -= 1; hi += 1; } else { var pad = (hi - lo) * 0.06; if (!fl) lo -= pad; if (!fh) hi += pad; }
+    if (hi - lo < 1e-9) { var m = Math.abs(lo) < 1e-9 ? 1 : Math.abs(lo) * 0.1; lo -= m; hi += m; }
+    else { var pad = (hi - lo) * 0.06; if (!fl) lo -= pad; if (!fh) hi += pad; }
     if (fl) lo = ymin;
     if (fh) hi = ymax;
     if (hi - lo < 1e-9) hi = lo + 1;
     return [lo, hi];
   };
+  /* A chart is "binary" once its window held both 0 and 1 and nothing else; it stays so through quiet moments. */
+  UD.sticky = function (prev, info) { return info.nonBin ? false : ((info.has0 && info.has1) ? true : !!prev); };
   function drawChart(ch) {
     var c = ch.canvas, ctx = c.getContext ? c.getContext('2d') : null;
     if (!ctx) return;
@@ -1182,10 +1370,12 @@ JS = r"""
     var L = 56, R = 8, Tp = 6, B = ch.last ? 20 : 4, pw = w - L - R, ph = h - Tp - B;
     var tmax = paused ? frozenT : (T.length ? T[T.length - 1] : 0), t0 = tmax - windowS;
     var i0 = UD.lowerBound(T, t0), i1 = T.length, k, i;
-    var lo = Infinity, hi = -Infinity;
+    var lo = Infinity, hi = -Infinity, bi = {nonBin: false, has0: false, has1: false};
     for (k = 0; k < ch.ids.length; k++) { var Y = V[ch.ids[k]]; if (!Y) continue;
-      for (i = i0; i < i1; i++) { var y = Y[i]; if (y === null || y === undefined) continue; if (y < lo) lo = y; if (y > hi) hi = y; } }
-    var rg = UD.range(ch.ymin, ch.ymax, lo, hi); lo = rg[0]; hi = rg[1];
+      for (i = i0; i < i1; i++) { var y = Y[i]; if (y === null || y === undefined) continue; if (y < lo) lo = y; if (y > hi) hi = y;
+        if (y === 0) bi.has0 = true; else if (y === 1) bi.has1 = true; else bi.nonBin = true; } }
+    ch.binSeen = UD.sticky(ch.binSeen, bi);
+    var rg = UD.range(ch.ymin, ch.ymax, lo, hi, ch.binary || (ch.binSeen && !bi.nonBin)); lo = rg[0]; hi = rg[1];
     function X(t) { return L + (t - t0) / windowS * pw; }
     function Yp(v) { return Tp + (hi - v) / (hi - lo) * ph; }
     ctx.font = '10px Helvetica, Arial, sans-serif'; ctx.lineWidth = 1;
@@ -1237,10 +1427,13 @@ JS = r"""
     var rows = UD.rowSlice(V, end, 9, sk), m = rows[rows.length - 1].length, r, j, i;
     if (m < 1) return;
     var L = 56, R = 10, Tp = 18, B = 22, pw = w - L - R, ph = h - Tp - B, lo = Infinity, hi = -Infinity;
+    var bi = {nonBin: false, has0: false, has1: false};
     for (r = 0; r < rows.length; r++) for (j = 0; j < rows[r].length; j++) {
       var y = rows[r][j]; if (y === null) continue; if (y < lo) lo = y; if (y > hi) hi = y;
+      if (y === 0) bi.has0 = true; else if (y === 1) bi.has1 = true; else bi.nonBin = true;
     }
-    var rg = UD.range(ch.ymin, ch.ymax, lo, hi); lo = rg[0]; hi = rg[1];
+    ch.binSeen = UD.sticky(ch.binSeen, bi);
+    var rg = UD.range(ch.ymin, ch.ymax, lo, hi, ch.binary || (ch.binSeen && !bi.nonBin)); lo = rg[0]; hi = rg[1];
     function X(k) { return m === 1 ? L + pw / 2 : L + k / (m - 1) * pw; }
     function Yp(v) { return Tp + (hi - v) / (hi - lo) * ph; }
     ctx.font = '10px Helvetica, Arial, sans-serif'; ctx.lineWidth = 1;
@@ -1275,6 +1468,65 @@ JS = r"""
     ctx.fillText(ch.title ? ch.title + (ch.unit ? '  [' + ch.unit + ']' : '') + '   (faint = previous rows)'
                           : 'latest row — fields ' + sk + ' … ' + (sk + m - 1) + '  (' + m + ' values, faint = previous rows)', L + 2, 2);
   }
+  function drawXY(ch) {
+    var c = ch.canvas, ctx = c.getContext ? c.getContext('2d') : null;
+    if (!ctx) return;
+    var dpr = window.devicePixelRatio || 1, w = c.clientWidth || 710, h = c.clientHeight || parseInt(c.style.height, 10) || 340;
+    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+    var L = 62, R = 16, Tp = 20, B = 36, pw = w - L - R, ph = h - Tp - B, i, a, b;
+    var XS = V[ch.xid], YS = V[ch.yid];
+    var end = T.length - 1; if (paused) end = Math.min(frozenIdx, end);
+    var start = Math.max(0, end - ch.trail + 1);
+    if (ch.fromT !== null) start = Math.max(start, UD.lowerBound(T, ch.fromT + 1e-9));
+    var xlo = Infinity, xhi = -Infinity, ylo = Infinity, yhi = -Infinity, n = 0;
+    if (XS && YS) for (i = start; i <= end; i++) {
+      a = XS[i]; b = YS[i]; if (a === null || a === undefined || b === null || b === undefined) continue;
+      if (a < xlo) xlo = a; if (a > xhi) xhi = a; if (b < ylo) ylo = b; if (b > yhi) yhi = b; n++;
+    }
+    var xr = UD.range(ch.xmin, ch.xmax, xlo, xhi), yr = UD.range(ch.ymin, ch.ymax, ylo, yhi);
+    function PX(v) { return L + (v - xr[0]) / (xr[1] - xr[0]) * pw; }
+    function PY(v) { return Tp + (yr[1] - v) / (yr[1] - yr[0]) * ph; }
+    ctx.font = '10px Helvetica, Arial, sans-serif'; ctx.lineWidth = 1;
+    var yt = UD.niceTicks(yr[0], yr[1], Math.max(3, Math.floor(ph / 40))), xt = UD.niceTicks(xr[0], xr[1], Math.max(3, Math.floor(pw / 90)));
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#666';
+    for (i = 0; i < yt.length; i++) {
+      var yy = Math.round(PY(yt[i])) + 0.5; ctx.strokeStyle = yt[i] === 0 ? '#bbb' : '#eee';
+      ctx.beginPath(); ctx.moveTo(L, yy); ctx.lineTo(L + pw, yy); ctx.stroke(); ctx.fillText(UD.fmt(yt[i]), L - 5, yy);
+    }
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    for (i = 0; i < xt.length; i++) {
+      var xx = Math.round(PX(xt[i])) + 0.5; ctx.strokeStyle = xt[i] === 0 ? '#bbb' : '#eee';
+      ctx.beginPath(); ctx.moveTo(xx, Tp); ctx.lineTo(xx, Tp + ph); ctx.stroke(); ctx.fillText(UD.fmt(xt[i]), xx, Tp + ph + 4);
+    }
+    ctx.strokeStyle = '#ccc'; ctx.strokeRect(L + 0.5, Tp + 0.5, pw, ph);
+    var xl = fname(ch.xid) + (funit(ch.xid) ? ' [' + funit(ch.xid) + ']' : ''), yl = fname(ch.yid) + (funit(ch.yid) ? ' [' + funit(ch.yid) + ']' : '');
+    ctx.fillStyle = '#333'; ctx.font = 'bold 11px Helvetica, Arial, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillText(xl, L + pw / 2, h - 15);
+    ctx.save(); ctx.translate(13, Tp + ph / 2); ctx.rotate(-Math.PI / 2); ctx.fillText(yl, 0, 0); ctx.restore();
+    ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, pw, ph); ctx.clip();      /* the trail: older = fainter */
+    var G = Math.min(24, Math.max(1, end - start)), g, pen;
+    for (g = 0; g < G && XS && YS; g++) {
+      var s0 = start + Math.floor((end - start) * g / G), s1 = start + Math.floor((end - start) * (g + 1) / G);
+      ctx.strokeStyle = 'rgba(45,125,210,' + (0.12 + 0.88 * (g + 1) / G).toFixed(3) + ')'; ctx.lineWidth = 1.5; ctx.beginPath(); pen = false;
+      for (i = s0; i <= s1; i++) {
+        a = XS[i]; b = YS[i];
+        if (a === null || a === undefined || b === null || b === undefined) { pen = false; continue; }
+        if (!pen) { ctx.moveTo(PX(a), PY(b)); pen = true; } else ctx.lineTo(PX(a), PY(b));
+      }
+      ctx.stroke();
+    }
+    if (n && XS && YS) {                                                   /* the current point */
+      a = XS[end]; b = YS[end];
+      if (a !== null && a !== undefined && b !== null && b !== undefined) {
+        ctx.fillStyle = '#e84855'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(PX(a), PY(b), 4.5, 0, 6.2832); ctx.fill(); ctx.stroke();
+      }
+    }
+    ctx.restore();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillStyle = '#333'; ctx.font = 'bold 11px Helvetica, Arial, sans-serif';
+    ctx.fillText((ch.title || (fname(ch.yid) + ' against ' + fname(ch.xid))) + '   (' + n + ' points)', L + 4, 3);
+  }
   function lastOf(i) { var a = V[i]; return a && a.length ? a[a.length - 1] : null; }
   function draw() {
     var i, j;
@@ -1285,7 +1537,7 @@ JS = r"""
           var id = ch.tiles[j].id;
           ch.tiles[j].v.textContent = UD.fmt(lastOf(id)) + (funit(id) ? ' ' + funit(id) : '');
         }
-      } else if (ch.row) drawRow(ch); else drawChart(ch);
+      } else if (ch.xy) drawXY(ch); else if (ch.row) drawRow(ch); else drawChart(ch);
     }
     if (S && T.length) for (i = 0; i < S.fields.length; i++) {
       var v = $('val' + i); if (v) v.textContent = UD.fmt(lastOf(i)) + (funit(i) ? ' ' + funit(i) : '');
@@ -1317,7 +1569,7 @@ JS = r"""
     $('disconnect').style.display = connected || connecting ? '' : 'none';
     $('port').disabled = connected || connecting;
     banner(j.state === 'error' || (j.state === 'disconnected' && j.error) ? j.error : '');
-    ['stream', 'rate', 'setrate', 'rec', 'refreshp', 'cmd', 'send'].forEach(function (id) { $(id).disabled = !connected; });
+    ['stream', 'stream2', 'rate', 'setrate', 'rec', 'refreshp', 'cmd', 'send'].forEach(function (id) { $(id).disabled = !connected; });
 
     var ui = j.cv + ':' + j.cfgv;
     if (ui !== uiKey) { uiKey = ui; buildStreams(); buildActions(); buildParams(); renderTabs(); renderPresets(); }
@@ -1326,7 +1578,7 @@ JS = r"""
     }
     var bs = document.querySelectorAll('#tabs button, #presets button, #acts button'), bi;
     for (bi = 0; bi < bs.length; bi++) bs[bi].disabled = !connected;
-    renderNotes(); markTabs(); updateParamValues();
+    renderNotes(); markTabs(); updateParamValues(); updateWith();
 
     if (j.epoch !== epoch) { epoch = j.epoch; T = []; V = []; lastT = null; fieldsKey = ''; }
     var key = j.fields.map(function (f) { return f.name; }).join('|');
@@ -1343,7 +1595,7 @@ JS = r"""
     if (j.rate !== null && document.activeElement !== $('rate')) $('rate').value = j.rate;
     $('rec').textContent = j.rec.on ? '■ Stop (' + j.rec.rows + ')' : '● Rec';
     $('recinfo').textContent = j.rec.path ? j.rec.path.split(/[\\/]/).pop() : '';
-    $('status2').textContent = (j.stream !== null ? (j.active_view ? 'view “' + j.active_view + '” · ' : '') + 'stream ' + j.stream + ' · ' + j.fields.length + ' fields · ' : '') +
+    $('status2').textContent = (j.stream !== null ? (j.active_view ? 'view “' + j.active_view + '” · ' : '') + 'stream ' + j.stream + (j.stream2 ? ' + ' + j.stream2 : '') + ' · ' + j.fields.length + ' fields · ' : '') +
       (j.ts ? 'device timestamps' : 'PC timestamps') + (j.bad ? ' · ' + j.bad + ' malformed lines skipped' : '');
 
     var r, i, k;
@@ -1378,11 +1630,21 @@ JS = r"""
     });
   });
   $('stream').addEventListener('change', function () { post('/api/stream', {id: this.value ? parseInt(this.value, 10) : null}); });
+  $('stream2').addEventListener('change', function () {
+    var v = this.value ? parseInt(this.value, 10) : null;
+    if (S && S.stream !== null && S.stream !== undefined) post('/api/stream', v === null ? {id: S.stream} : {id: S.stream, also: v});
+  });
   $('setrate').addEventListener('click', function () { post('/api/rate', {rate: parseInt($('rate').value, 10) || 20}); });
   $('rate').addEventListener('keydown', function (e) { if (e.keyCode === 13) $('setrate').click(); });
   $('win').addEventListener('change', function () { windowS = parseFloat(this.value); draw(); });
   $('layout').addEventListener('change', function () { layout = this.value; layoutTouched = true; if (S) { buildCharts(); draw(); } });
   $('view').addEventListener('change', function () { viewMode = this.value; viewTouched = true; showSkip(); if (S) { buildCharts(); draw(); } });
+  $('xsel').addEventListener('change', xyChanged); $('ysel').addEventListener('change', xyChanged); $('trail').addEventListener('change', xyChanged);
+  $('xyclear').addEventListener('click', function () {
+    genXY.fromT = T.length ? T[T.length - 1] : null;
+    if (charts.length && charts[0].xy) charts[0].fromT = genXY.fromT;
+    draw();
+  });
   function setSkip() { skipN = Math.max(0, parseInt($('skip').value, 10) || 0); draw(); }
   $('skip').addEventListener('input', setSkip); $('skip').addEventListener('change', setSkip);
   $('pause').addEventListener('click', function () {
@@ -1402,8 +1664,13 @@ JS = r"""
       var kv = q[i].split('=');
       if (kv[0] === 'layout' && (kv[1] === 'one' || kv[1] === 'stack')) { layout = kv[1]; layoutTouched = true; $('layout').value = kv[1]; }
       if (kv[0] === 'window' && /^\d+$/.test(kv[1])) { windowS = parseFloat(kv[1]); $('win').value = kv[1]; }
-      if (kv[0] === 'view' && (kv[1] === 'row' || kv[1] === 'time')) { viewMode = kv[1]; viewTouched = true; $('view').value = kv[1]; showSkip(); }
+      if (kv[0] === 'view' && (kv[1] === 'row' || kv[1] === 'time' || kv[1] === 'xy')) { viewMode = kv[1]; viewTouched = true; $('view').value = kv[1]; showSkip(); }
       if (kv[0] === 'skip' && /^\d+$/.test(kv[1])) { skipN = parseInt(kv[1], 10); $('skip').value = kv[1]; }
+      if ((kv[0] === 'x' || kv[0] === 'y') && kv[1]) { xyWant = xyWant || {}; xyWant[kv[0]] = decodeURIComponent(kv[1]); }
+      if (kv[0] === 'trail' && /^\d+$/.test(kv[1]) && parseInt(kv[1], 10) >= 2 && parseInt(kv[1], 10) <= 5000) {
+        genXY.trail = parseInt(kv[1], 10);
+        var topt = el('option', '', kv[1]); topt.value = kv[1]; $('trail').appendChild(topt); $('trail').value = kv[1];
+      }
     }
   })();
 
@@ -1423,13 +1690,17 @@ PAGE = """<!doctype html>
 <div id="main">
  <div id="tabs"></div>
  <div id="bar"><span class="g" id="grp-stream"><label>Stream</label><select id="stream" disabled><option value="">— no stream —</option></select></span>
+ <span class="g" id="grp-with" style="display:none"><label>with</label><select id="stream2"><option value="">— none —</option></select></span>
   <span class="g"><label>Rate</label><input type="number" id="rate" value="20" min="1" max="500" style="width:58px" disabled>
   <button id="setrate" disabled>Set</button></span>
   <span class="g"><label>Window</label><select id="win"><option value="2">2 s</option><option value="5">5 s</option>
    <option value="10" selected>10 s</option><option value="30">30 s</option><option value="60">60 s</option></select></span>
   <span class="g" id="grp-layout"><label>Layout</label><select id="layout"><option value="stack">one chart per field</option><option value="one">all in one</option></select></span>
-  <span class="g" id="grp-view"><label>View</label><select id="view"><option value="time">over time</option><option value="row">latest row</option></select></span>
+  <span class="g" id="grp-view"><label>View</label><select id="view"><option value="time">over time</option><option value="row">latest row</option><option value="xy">x–y plot</option></select></span>
   <span class="g" id="skipbox" style="display:none"><label>skip first</label><input type="number" id="skip" value="0" min="0" style="width:50px"></span>
+  <span class="g" id="xybox" style="display:none"><label>X</label><select id="xsel"></select> <label>Y</label><select id="ysel"></select>
+   <label>trail</label><select id="trail"><option value="100">100</option><option value="300" selected>300</option><option value="1000">1000</option><option value="3000">3000</option></select>
+   <button id="xyclear" class="mini">Clear trail</button></span>
   <span class="g"><button id="pause">Pause</button> <a href="/api/csv" download="uniproto_buffer.csv"><button>Save CSV</button></a>
   <button id="rec" disabled>● Rec</button><span id="recinfo" class="hint"></span></span></div>
  <div id="charts"><div class="hint">Connect to a board, then pick a stream.</div></div>
@@ -1505,10 +1776,11 @@ def create_app(device=None, strict_host=True, record_dir=ROOT / "recordings", po
 
     @app.post("/api/stream")
     def api_stream():
-        sid = body().get("id")
-        if sid is not None and not isinstance(sid, int):
-            return jsonify(ok=False, message="bad stream id"), 400
-        return result(dev.set_stream(sid))
+        sid, also = body().get("id"), body().get("also")
+        for v in (sid, also):
+            if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
+                return jsonify(ok=False, message="bad stream id"), 400
+        return result(dev.set_stream(sid, also=also))
 
     @app.post("/api/view")
     def api_view():
@@ -1564,6 +1836,8 @@ def main():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--stream", type=int, default=None, help="stream id to start streaming at connect")
     ap.add_argument("--rate", type=int, default=None, help="rate in Hz to set at connect")
+    ap.add_argument("--with", type=int, default=None, dest="with_stream", metavar="ID",
+                    help="with --stream: show a second stream together with it (both must start with a sid field)")
     ap.add_argument("--host", default="127.0.0.1", help="address to listen on (default: this computer only)")
     ap.add_argument("--flask-port", type=int, default=DEFAULT_WEB_PORT, help="web port (default 5000)")
     ap.add_argument("--no-browser", action="store_true")
@@ -1572,12 +1846,30 @@ def main():
     ap.add_argument("--config", action="append", default=[], metavar="FILE", help="a board config (dashboard.json); can be repeated")
     ap.add_argument("--config-dir", action="append", default=[], metavar="DIR", help="an extra folder to search for board configs")
     ap.add_argument("--no-config", action="store_true", help="ignore board configs (generic dashboard only)")
+    ap.add_argument("--make-config", action="store_true",
+                    help="connect, print a starter dashboard.json for this board (edit it, save it as src/<setup>/dashboard.json) and exit")
     ap.add_argument("--list-ports", action="store_true")
     args = ap.parse_args()
 
     if args.list_ports:
         for p in list_ports():
             print(f"{p['device']:36s} {'*' if p['likely'] else ' '} {p['description']}")
+        return
+
+    if args.make_config:                      # a starter board config, built from what the board reports
+        if not args.port:
+            sys.exit("--make-config needs --port")
+        probe = Device(args.record_dir, args.boot_wait, configs=BC.ConfigStore())
+        probe.param_refresh_s = 0
+        probe.connect(args.port, args.baud)
+        t_end = time.time() + 40
+        while probe.state == "connecting" and time.time() < t_end:
+            time.sleep(0.1)
+        if probe.state != "connected":
+            sys.exit(probe.error or "Could not connect.")
+        caps = probe.caps
+        probe.disconnect()
+        print(json.dumps(BC.starter_config(caps), indent=2, ensure_ascii=False))
         return
 
     strict = args.host in ("127.0.0.1", "localhost", "::1")
@@ -1599,7 +1891,7 @@ def main():
     signal.signal(signal.SIGTERM, on_term)
 
     if args.port:
-        ok, msg = dev.connect(args.port, args.baud, args.stream, args.rate)
+        ok, msg = dev.connect(args.port, args.baud, args.stream, args.rate, args.with_stream)
         print(msg, flush=True)
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()

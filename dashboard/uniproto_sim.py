@@ -2,7 +2,7 @@
 """
 uniproto_sim.py — a simulated UniProto Arduino, for trying the dashboard without hardware.
 
-  python dashboard/uniproto_sim.py [--board dc_motor|qtr8]
+  python dashboard/uniproto_sim.py [--board dc_motor|qtr8|sensor_shield]
       Simulated UniProto device 'SimLab' is listening on /dev/ttys005
       Try it:   python dashboard/dashboard.py --port /dev/ttys005
 
@@ -243,7 +243,7 @@ class SimDevice:
     def _caps(self):
         streams = ",".join(f'{{"id":{s.id},"name":"{s.name}","schema":"{s.schema}","units":"{s.units}"}}'
                            for s in self.streams)
-        params = ",".join(f'"{k}"' for k in self.p) + ',"rate","format","timestamp","stream"'
+        params = ",".join([f'"{k}"' for k in self.p] + ['"rate"', '"format"', '"timestamp"', '"stream"'])
         actions = ",".join(f'"{a}"' for a in self.actions)
         self._write(f'{{"device":"{self.name}","streams":[{streams}],"params":[{params}],'
                     f'"actions":[{actions}],"cmds":["?","?key","!key:value","@action[:args]"]}}')
@@ -413,13 +413,85 @@ class QTR8Sim(SimDevice):
         return True
 
 
-BOARDS = {"simlab": SimDevice, "dc_motor": DCMotorSim, "qtr8": QTR8Sim}
+class SensorShieldSim(SimDevice):
+    """Looks like src/sensor_shield: 7 streams that each start with their own id (sid); no parameters, no actions."""
+
+    def __init__(self, name="SensorShield", drop_first_caps=False, angle=True):
+        self.angle = angle                     # the stream 8 'angle' (pot counts + Hall degrees) exists in the newer sketch
+        super().__init__(name, drop_first_caps)
+        self.foil = 0.0
+
+    def _init_params(self):
+        self.p = {}
+        self.defaults = {}
+
+    def _init_streams(self):
+        self.streams = [
+            Stream(1, "analog", "u16,u16,u16,u16,u16,u16,u16", "sid,A0,A1,A2,A3,A4,A5", self._emit_analog),
+            Stream(2, "force", "u16,f32,f32", "sid,foil_g,strain_g", self._emit_force),
+            Stream(3, "hall", "u16,f32", "sid,deg", self._emit_hall),
+            Stream(4, "encoder", "u16,i32,f32", "sid,pos,vel", self._emit_encoder),
+            Stream(5, "cap", "u16,f32,f32,f32", "sid,A,B,pos_mm", self._emit_cap),
+            Stream(6, "rc", "u16,u16,f32", "sid,count,ref_v", self._emit_rc),
+            Stream(7, "us", "u16,f32", "sid,cm", self._emit_us),
+        ]
+        if self.angle:
+            self.streams.append(Stream(8, "angle", "u16,u16,f32", "sid,pot,hall_deg", self._emit_angle))
+        self.actions = {}
+
+    def _load(self):                           # a load slowly pressed and released (grams)
+        return 400.0 * (0.5 - 0.5 * math.cos(0.8 * self._now()))
+
+    def step(self, dt):                        # the foil sensor lags the true load: a hysteresis loop in an XY plot
+        self.foil += (0.9 * self._load() + 20.0 - self.foil) * min(1.0, dt * 2.5)
+
+    def _emit_analog(self):
+        t = self._now()
+        pot = (130 + 110 * math.sin(0.5 * t)) / 0.4                  # A0: the pot, on the same shaft as the Hall sensor
+        vals = [pot, 340 + 40 * math.sin(2 * t), 200 + 0.5 * self.foil,
+                330 + 0.4 * self._load(), 338 + 160 * math.sin(0.5 * t), 338 + 160 * math.cos(0.5 * t)]
+        return ["1"] + [str(int(max(0, min(675, v + self._rand.gauss(0, 2))))) for v in vals]
+
+    def _emit_force(self):
+        return ["2", f"{self.foil + self._rand.gauss(0, 2):.1f}", f"{self._load() + self._rand.gauss(0, 1.5):.1f}"]
+
+    def _emit_hall(self):
+        return ["3", f"{150 + 110 * math.sin(0.5 * self._now()):.2f}"]
+
+    def _emit_encoder(self):
+        t = self._now()
+        return ["4", str(int(1200 * math.sin(0.5 * t))), f"{600 * math.cos(0.5 * t):.1f}"]
+
+    def _emit_cap(self):
+        t = self._now()
+        return ["5", f"{50 + 40 * math.sin(1.1 * t):.1f}", f"{50 - 40 * math.sin(1.1 * t):.1f}", f"{20 + 15 * math.sin(1.1 * t):.1f}"]
+
+    def _emit_rc(self):
+        return ["6", str(int(500 + 300 * math.sin(2 * self._now()))), f"{3.3 + self._rand.gauss(0, 0.004):.3f}"]
+
+    def _emit_us(self):
+        return ["7", f"{80 + 60 * math.sin(0.3 * self._now()):.1f}"]
+
+    def _emit_angle(self):                     # pot on the same shaft as the Hall sensor: 0.4 deg per count, 20 deg offset
+        hall = 150 + 110 * math.sin(0.5 * self._now())
+        return ["8", str(int(max(0, min(675, (hall - 20) / 0.4 + self._rand.gauss(0, 3))))), f"{hall:.2f}"]
+
+
+class SensorShieldSimOld(SensorShieldSim):
+    """The sketch before the 'angle' stream existed (7 streams): to check that configs still work on older firmware."""
+
+    def __init__(self, name="SensorShield", drop_first_caps=False):
+        super().__init__(name, drop_first_caps, angle=False)
+
+
+BOARDS = {"simlab": SimDevice, "dc_motor": DCMotorSim, "qtr8": QTR8Sim, "sensor_shield": SensorShieldSim,
+          "sensor_shield_old": SensorShieldSimOld}
 
 
 def main():
     ap = argparse.ArgumentParser(description="simulated UniProto device on a pseudo-terminal")
     ap.add_argument("--board", choices=sorted(BOARDS), default="simlab",
-                    help="what to pretend to be: simlab (demo, default), dc_motor or qtr8 (same streams/parameters as the real sketches)")
+                    help="what to pretend to be: simlab (demo, default), or dc_motor / qtr8 / sensor_shield[_old] (same streams and parameters as the real sketches)")
     ap.add_argument("--name", default=None, help="device name reported by '?' (default depends on --board)")
     ap.add_argument("--drop-first-caps", action="store_true",
                     help="ignore the first '?' (simulates a board that is still booting)")
